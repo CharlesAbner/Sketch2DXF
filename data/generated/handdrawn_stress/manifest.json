@@ -1,0 +1,924 @@
+{
+  "schema_version": "handdrawn-stress-v1",
+  "seed": 20260430,
+  "generator": "tools/generate_handdrawn_tests.py",
+  "cases": [
+    {
+      "case_id": "101_series_clean",
+      "stressors": [
+        "baseline",
+        "hand_jitter"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            116,
+            278,
+            224,
+            362
+          ],
+          "pins": [
+            [
+              170,
+              236
+            ],
+            [
+              170,
+              404
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            372,
+            136,
+            488,
+            204
+          ],
+          "pins": [
+            [
+              356,
+              170
+            ],
+            [
+              504,
+              170
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            646,
+            262,
+            714,
+            378
+          ],
+          "pins": [
+            [
+              680,
+              246
+            ],
+            [
+              680,
+              394
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "R2.p1"
+        ],
+        [
+          "R2.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/101_series_clean.png"
+    },
+    {
+      "case_id": "102_parallel_branches",
+      "stressors": [
+        "parallel",
+        "multi_terminal_same_node"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            106,
+            278,
+            214,
+            362
+          ],
+          "pins": [
+            [
+              160,
+              236
+            ],
+            [
+              160,
+              404
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            382,
+            168,
+            558,
+            252
+          ],
+          "pins": [
+            [
+              396,
+              210
+            ],
+            [
+              544,
+              210
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            412,
+            396,
+            528,
+            464
+          ],
+          "pins": [
+            [
+              396,
+              430
+            ],
+            [
+              544,
+              430
+            ]
+          ],
+          "orientation": "h"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1",
+          "R2.p1"
+        ],
+        [
+          "R1.p2",
+          "R2.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/102_parallel_branches.png"
+    },
+    {
+      "case_id": "103_broken_gap",
+      "stressors": [
+        "intentional_wire_gap",
+        "gap_bridge_review"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            106,
+            278,
+            214,
+            362
+          ],
+          "pins": [
+            [
+              160,
+              236
+            ],
+            [
+              160,
+              404
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            397,
+            136,
+            513,
+            204
+          ],
+          "pins": [
+            [
+              381,
+              170
+            ],
+            [
+              529,
+              170
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "C1",
+          "class_name": "capacitor",
+          "bbox": [
+            662,
+            286,
+            778,
+            354
+          ],
+          "pins": [
+            [
+              720,
+              246
+            ],
+            [
+              720,
+              394
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "C1.p1"
+        ],
+        [
+          "C1.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/103_broken_gap.png"
+    },
+    {
+      "case_id": "104_text_noise_near_wire",
+      "stressors": [
+        "letter_residue",
+        "unsupported_evidence_review"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            101,
+            293,
+            209,
+            377
+          ],
+          "pins": [
+            [
+              155,
+              251
+            ],
+            [
+              155,
+              419
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            392,
+            156,
+            508,
+            224
+          ],
+          "pins": [
+            [
+              376,
+              190
+            ],
+            [
+              524,
+              190
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            696,
+            277,
+            764,
+            393
+          ],
+          "pins": [
+            [
+              730,
+              261
+            ],
+            [
+              730,
+              409
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "R2.p1"
+        ],
+        [
+          "R2.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/104_text_noise_near_wire.png"
+    },
+    {
+      "case_id": "105_crossing_no_connect",
+      "stressors": [
+        "crossing_without_connection",
+        "false_junction_risk"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            96,
+            268,
+            204,
+            352
+          ],
+          "pins": [
+            [
+              150,
+              226
+            ],
+            [
+              150,
+              394
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            337,
+            118,
+            513,
+            202
+          ],
+          "pins": [
+            [
+              351,
+              160
+            ],
+            [
+              499,
+              160
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            367,
+            426,
+            483,
+            494
+          ],
+          "pins": [
+            [
+              351,
+              460
+            ],
+            [
+              499,
+              460
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "C1",
+          "class_name": "capacitor",
+          "bbox": [
+            692,
+            276,
+            808,
+            344
+          ],
+          "pins": [
+            [
+              750,
+              236
+            ],
+            [
+              750,
+              384
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "C1.p1"
+        ],
+        [
+          "C1.p2",
+          "R2.p2"
+        ],
+        [
+          "R2.p1",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/105_crossing_no_connect.png"
+    },
+    {
+      "case_id": "106_fake_line_near_terminal",
+      "stressors": [
+        "near_terminal_false_candidate",
+        "ambiguous_attachment"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            106,
+            288,
+            214,
+            372
+          ],
+          "pins": [
+            [
+              160,
+              246
+            ],
+            [
+              160,
+              414
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            392,
+            146,
+            508,
+            214
+          ],
+          "pins": [
+            [
+              376,
+              180
+            ],
+            [
+              524,
+              180
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            696,
+            272,
+            764,
+            388
+          ],
+          "pins": [
+            [
+              730,
+              256
+            ],
+            [
+              730,
+              404
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "R2.p1"
+        ],
+        [
+          "R2.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/106_fake_line_near_terminal.png"
+    },
+    {
+      "case_id": "107_slanted_wires",
+      "stressors": [
+        "slanted_handdrawn_wire",
+        "orientation_threshold"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            116,
+            278,
+            224,
+            362
+          ],
+          "pins": [
+            [
+              170,
+              236
+            ],
+            [
+              170,
+              404
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            372,
+            123,
+            548,
+            207
+          ],
+          "pins": [
+            [
+              386,
+              165
+            ],
+            [
+              534,
+              165
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "C1",
+          "class_name": "capacitor",
+          "bbox": [
+            662,
+            286,
+            778,
+            354
+          ],
+          "pins": [
+            [
+              720,
+              246
+            ],
+            [
+              720,
+              394
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "C1.p1"
+        ],
+        [
+          "C1.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/107_slanted_wires.png"
+    },
+    {
+      "case_id": "108_t_junction_branch",
+      "stressors": [
+        "t_junction",
+        "multi_pin_node"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            96,
+            278,
+            204,
+            362
+          ],
+          "pins": [
+            [
+              150,
+              236
+            ],
+            [
+              150,
+              404
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            362,
+            136,
+            478,
+            204
+          ],
+          "pins": [
+            [
+              346,
+              170
+            ],
+            [
+              494,
+              170
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            606,
+            302,
+            674,
+            418
+          ],
+          "pins": [
+            [
+              640,
+              286
+            ],
+            [
+              640,
+              434
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "C1",
+          "class_name": "capacitor",
+          "bbox": [
+            386,
+            442,
+            454,
+            558
+          ],
+          "pins": [
+            [
+              346,
+              500
+            ],
+            [
+              494,
+              500
+            ]
+          ],
+          "orientation": "h"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "R2.p1"
+        ],
+        [
+          "R2.p2",
+          "C1.p2"
+        ],
+        [
+          "C1.p1",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/108_t_junction_branch.png"
+    },
+    {
+      "case_id": "109_tiny_loop",
+      "stressors": [
+        "small_layout",
+        "short_segments"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            196,
+            278,
+            304,
+            362
+          ],
+          "pins": [
+            [
+              250,
+              236
+            ],
+            [
+              250,
+              404
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            442,
+            206,
+            558,
+            274
+          ],
+          "pins": [
+            [
+              426,
+              240
+            ],
+            [
+              574,
+              240
+            ]
+          ],
+          "orientation": "h"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/109_tiny_loop.png"
+    },
+    {
+      "case_id": "110_rc_ladder",
+      "stressors": [
+        "ladder",
+        "branch_to_bus",
+        "t_junction"
+      ],
+      "expected_components": [
+        {
+          "id": "B1",
+          "class_name": "voltage_source",
+          "bbox": [
+            76,
+            288,
+            184,
+            372
+          ],
+          "pins": [
+            [
+              130,
+              246
+            ],
+            [
+              130,
+              414
+            ]
+          ],
+          "orientation": "v"
+        },
+        {
+          "id": "R1",
+          "class_name": "resistor",
+          "bbox": [
+            262,
+            148,
+            438,
+            232
+          ],
+          "pins": [
+            [
+              276,
+              190
+            ],
+            [
+              424,
+              190
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "R2",
+          "class_name": "resistor",
+          "bbox": [
+            552,
+            156,
+            668,
+            224
+          ],
+          "pins": [
+            [
+              536,
+              190
+            ],
+            [
+              684,
+              190
+            ]
+          ],
+          "orientation": "h"
+        },
+        {
+          "id": "C1",
+          "class_name": "capacitor",
+          "bbox": [
+            422,
+            356,
+            538,
+            424
+          ],
+          "pins": [
+            [
+              480,
+              316
+            ],
+            [
+              480,
+              464
+            ]
+          ],
+          "orientation": "v"
+        }
+      ],
+      "expected_nets": [
+        [
+          "B1.p1",
+          "R1.p1"
+        ],
+        [
+          "R1.p2",
+          "R2.p1",
+          "C1.p1"
+        ],
+        [
+          "R2.p2",
+          "C1.p2",
+          "B1.p2"
+        ]
+      ],
+      "image_path": "data/generated/handdrawn_stress/110_rc_ladder.png"
+    }
+  ]
+}

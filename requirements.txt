@@ -1,0 +1,10 @@
+numpy
+opencv-python
+scikit-image
+matplotlib
+ezdxf
+gradio
+pydantic
+langgraph
+openai
+ultralytics>=8.3.0

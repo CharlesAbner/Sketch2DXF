@@ -1,0 +1,32 @@
+# Python / local runtime
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Generated outputs and local agent memory
+outputs/
+
+# Local editor / assistant state
+.vscode/
+.claude/
+.codex_backups/
+
+# Large detector artifacts; keep scripts/configs in detector, not datasets/runs/weights.
+detector/datasets/
+detector/runs/
+detector/weights/
+detector/*.pt
+
+# Large model artifacts
+models/
+
+# Notebook runtime noise
+.ipynb_checkpoints/
