@@ -29,6 +29,8 @@ EVIDENCE_REVIEW_MAX_CANDIDATES = 8
 GAP_BRIDGE_MERGE_MAX_CANDIDATES = 8
 SINGLE_PIN_STUB_BRIDGE_MAX_CANDIDATES = 8
 SINGLE_PIN_STUB_BRIDGE_MAX_BBOX_GAP = 90.0
+SINGLE_PIN_PAIR_BRIDGE_MAX_BBOX_GAP = 145.0
+AXIS_FLIP_NEAREST_NODE_MAX_DISTANCE = 150.0
 REPAIR_DRY_RUN_MAX_CANDIDATES = 16
 REATTACH_PIN_MIN_ATTACHMENT_SCORE = 0.55
 REATTACH_PIN_WEAK_CONFIDENCE = 0.75
@@ -272,6 +274,17 @@ def _bbox_gap(left: list[float] | None, right: list[float] | None) -> dict[str, 
     return {"dx": dx, "dy": dy, "distance": distance, "axis_aligned": axis_aligned}
 
 
+def _point_to_bbox_gap(point: tuple[float, float], bbox: list[float] | None) -> dict[str, float | bool]:
+    if not bbox or len(bbox) < 4:
+        return {"dx": 999999.0, "dy": 999999.0, "distance": 999999.0, "axis_aligned": False}
+    x, y = point
+    x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+    dx = max(x1 - x, x - x2, 0.0)
+    dy = max(y1 - y, y - y2, 0.0)
+    distance = math.hypot(dx, dy)
+    return {"dx": dx, "dy": dy, "distance": distance, "axis_aligned": dx <= 8.0 or dy <= 8.0}
+
+
 def _node_lookup(nodes_payload: dict[str, Any], topology: dict[str, Any]) -> dict[str, dict[str, Any]]:
     nodes = nodes_payload.get("nodes") or topology.get("nodes", [])
     return {str(node.get("node_id")): node for node in nodes if node.get("node_id")}
@@ -295,12 +308,15 @@ def _score_merge_candidate(
     after: dict[str, Any],
     gap: dict[str, float | bool],
     both_single_pin: bool,
+    target_pin_count: int,
     agent_audit: dict[str, Any] | None,
 ) -> float:
     improvement = before["single_pin_net_count"] - after["single_pin_net_count"]
     score = 0.2
     if both_single_pin:
         score += 0.25
+    elif target_pin_count >= 2:
+        score += 0.16
     if improvement > 0:
         score += min(0.3, improvement * 0.15)
     distance = float(gap["distance"])
@@ -337,30 +353,36 @@ def _generate_merge_node_candidates(
     single_pin_node_ids = [
         node_id for node_id in _single_pin_node_ids(agent_audit, topology) if node_id in nodes
     ]
-    if len(single_pin_node_ids) < 2:
+    if not single_pin_node_ids:
         return []
 
     before = _metrics_for_merge(topology)
     candidates: list[dict[str, Any]] = []
     candidate_index = 1
-    for left_index, left_id in enumerate(single_pin_node_ids):
-        for right_id in single_pin_node_ids[left_index + 1 :]:
+    for left_id in single_pin_node_ids:
+        for right_id, right_node in nodes.items():
+            if right_id == left_id:
+                continue
             left_node = nodes[left_id]
-            right_node = nodes[right_id]
+            if set(left_node.get("component_ids", []) or []).intersection(right_node.get("component_ids", []) or []):
+                continue
             gap = _bbox_gap(left_node.get("bbox"), right_node.get("bbox"))
             if float(gap["distance"]) > MERGE_NODE_MAX_BBOX_GAP:
                 continue
             after = _metrics_for_merge(topology, [left_id, right_id])
             validation = validate_topology_candidate("merge_nodes", before, after)
             blocking = validation["blocking_issues"]
-            score = _score_merge_candidate(before, after, gap, True, agent_audit)
+            target_pin_count = _node_pin_count(right_node)
+            both_single_pin = _node_pin_count(left_node) == 1 and target_pin_count == 1
+            score = _score_merge_candidate(before, after, gap, both_single_pin, target_pin_count, agent_audit)
             improved = validation["improved_metrics"]
             regressed = validation["regressed_metrics"]
             validation_result = validation["validation_result"]
             risk = _risk_level(score, blocking, float(gap["distance"]))
             target_pins = sorted(set(left_node.get("pin_ids", []) + right_node.get("pin_ids", [])))
             reasons = [
-                "Both target nodes are single-pin nets.",
+                "Source node is a single-pin net.",
+                f"Target node has {target_pin_count} pin(s).",
                 f"BBox gap is {round(float(gap['distance']), 3)} px.",
                 "Candidate is axis-aligned." if gap["axis_aligned"] else "Candidate is not axis-aligned.",
                 f"Single-pin net count changes {before['single_pin_net_count']} -> {after['single_pin_net_count']}.",
@@ -911,6 +933,48 @@ def _score_axis_flip_candidate(
     return round(min(score, 0.95), 3)
 
 
+def _nearest_node_overrides_for_pin_group(
+    pin_group: dict[str, Any],
+    nodes: dict[str, dict[str, Any]],
+    component_id: str,
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    overrides: dict[str, str] = {}
+    evidence: list[dict[str, Any]] = []
+    for pin in pin_group.get("pins", []) or []:
+        pin_id = str(pin.get("pin_id") or "")
+        if not pin_id:
+            continue
+        point = (float(pin.get("x", 0.0) or 0.0), float(pin.get("y", 0.0) or 0.0))
+        ranked = []
+        for node_id, node in nodes.items():
+            if component_id in {str(item) for item in node.get("component_ids", []) or []}:
+                continue
+            gap = _point_to_bbox_gap(point, node.get("bbox"))
+            distance = float(gap.get("distance", 999999.0) or 999999.0)
+            if distance > AXIS_FLIP_NEAREST_NODE_MAX_DISTANCE:
+                continue
+            if not gap.get("axis_aligned") and distance > 80:
+                continue
+            ranked.append((distance, node_id, node, gap))
+        ranked.sort(key=lambda item: item[0])
+        if not ranked:
+            continue
+        distance, node_id, node, gap = ranked[0]
+        overrides[pin_id] = node_id
+        evidence.append(
+            {
+                "pin_id": pin_id,
+                "target_node_id": node_id,
+                "distance": round(distance, 3),
+                "bbox_gap": gap,
+                "target_pin_ids": node.get("pin_ids", []),
+                "target_component_ids": node.get("component_ids", []),
+                "source": "nearest_node_after_axis_flip",
+            }
+        )
+    return overrides, evidence
+
+
 def _generate_axis_flip_candidates(
     debug_dir: Path,
     agent_audit: dict[str, Any] | None,
@@ -919,6 +983,7 @@ def _generate_axis_flip_candidates(
     evidence_graph = _read_json(debug_dir / "evidence_graph.json") or {}
     nodes_payload = _read_json(debug_dir / "nodes.json") or {}
     raw_to_node = _raw_component_to_node_lookup(topology, nodes_payload)
+    nodes = _node_lookup(nodes_payload, topology)
     components = _component_lookup(topology)
     pin_groups = _pin_group_lookup(topology)
     before = _metrics_for_merge(topology)
@@ -932,22 +997,36 @@ def _generate_axis_flip_candidates(
         current_axis = str(current_group.get("axis") or "horizontal")
         if current_axis not in {"horizontal", "vertical"}:
             continue
+        current_pin_ids = [str(pin.get("pin_id")) for pin in current_group.get("pins", []) if pin.get("pin_id")]
+        current_has_unmatched_pin = bool(set(current_pin_ids).intersection(before.get("unmatched_pin_ids", [])))
         alternate_axis = "vertical" if current_axis == "horizontal" else "horizontal"
         alternate_group = _pin_group_for_axis(component, current_group, alternate_axis)
         if not alternate_group:
             continue
         current_score = _score_axis_group(current_group, evidence_graph, raw_to_node)
         alternate_score = _score_axis_group(alternate_group, evidence_graph, raw_to_node)
-        if not alternate_score["pin_node_overrides"]:
+        pin_node_overrides = dict(alternate_score["pin_node_overrides"])
+        nearest_evidence: list[dict[str, Any]] = []
+        if not pin_node_overrides:
+            pin_node_overrides, nearest_evidence = _nearest_node_overrides_for_pin_group(
+                alternate_group,
+                nodes,
+                component_id,
+            )
+            if nearest_evidence and not current_has_unmatched_pin and current_group.get("axis_source") != "fallback":
+                pin_node_overrides = {}
+                nearest_evidence = []
+        if not pin_node_overrides:
             continue
         if (
             alternate_score["attached_pin_count"] <= current_score["attached_pin_count"]
             and alternate_score["attached_score_sum"] <= current_score["attached_score_sum"] + 0.25
             and before["unmatched_pin_count"] == 0
+            and not nearest_evidence
         ):
             continue
 
-        after = _metrics_for_merge(topology, pin_node_overrides=alternate_score["pin_node_overrides"])
+        after = _metrics_for_merge(topology, pin_node_overrides=pin_node_overrides)
         validation = validate_topology_candidate("component_pin_axis_flip", before, after)
         score = _score_axis_flip_candidate(
             before,
@@ -957,8 +1036,10 @@ def _generate_axis_flip_candidates(
             str(current_group.get("axis_source", "")),
             agent_audit,
         )
+        if nearest_evidence:
+            score = round(min(0.95, score + 0.08), 3)
         risk = _risk_level_for_validation(validation, score)
-        target_pins = [str(pin.get("pin_id")) for pin in current_group.get("pins", []) if pin.get("pin_id")]
+        target_pins = current_pin_ids
         candidates.append(
             {
                 "candidate_id": f"AXF{candidate_index}",
@@ -966,8 +1047,8 @@ def _generate_axis_flip_candidates(
                 "summary": (
                     f"Dry-run flip {component_id} pins from {current_axis} to {alternate_axis}."
                 ),
-                "target_nodes": sorted(set(alternate_score["pin_node_overrides"].values())),
-                "affected_nets": sorted(set(alternate_score["pin_node_overrides"].values())),
+                "affected_nets": sorted(set(pin_node_overrides.values())),
+                "target_nodes": sorted(set(pin_node_overrides.values())),
                 "target_pins": target_pins,
                 "target_component_id": component_id,
                 "geometry": {
@@ -975,7 +1056,8 @@ def _generate_axis_flip_candidates(
                     "current_axis": current_axis,
                     "alternate_axis": alternate_axis,
                     "replacement_pin_group": alternate_group,
-                    "pin_node_overrides": alternate_score["pin_node_overrides"],
+                    "pin_node_overrides": pin_node_overrides,
+                    "nearest_node_evidence": nearest_evidence,
                 },
                 "before_metrics": before,
                 "after_metrics": after,
@@ -996,6 +1078,7 @@ def _generate_axis_flip_candidates(
                 "evidence": {
                     "current_axis_score": current_score,
                     "alternate_axis_score": alternate_score,
+                    "nearest_node_after_axis_flip": nearest_evidence,
                 },
                 "mutates_topology": False,
             }
@@ -1388,6 +1471,98 @@ def _generate_single_pin_stub_bridge_candidates(
             )
             candidate_index += 1
 
+    for left_index, (left_id, left_node) in enumerate(single_pin_nodes):
+        left_pin_id = _node_pin_ids(left_node)[0]
+        left_attachment = attachments_by_pin.get(left_pin_id, {})
+        left_score = float(left_attachment.get("best_attachment_score", 0.0) or 0.0)
+        if left_score < STUB_BRIDGE_MIN_ATTACHMENT_SCORE:
+            continue
+        for right_id, right_node in single_pin_nodes[left_index + 1 :]:
+            right_pin_id = _node_pin_ids(right_node)[0]
+            if set(left_node.get("component_ids", []) or []).intersection(right_node.get("component_ids", []) or []):
+                continue
+            right_attachment = attachments_by_pin.get(right_pin_id, {})
+            right_score = float(right_attachment.get("best_attachment_score", 0.0) or 0.0)
+            if right_score < STUB_BRIDGE_MIN_ATTACHMENT_SCORE:
+                continue
+            pair = tuple(sorted([left_id, right_id]))
+            if pair in seen_pairs:
+                continue
+            gap = _bbox_gap(left_node.get("bbox"), right_node.get("bbox"))
+            distance = float(gap.get("distance", 999999.0) or 999999.0)
+            if distance > SINGLE_PIN_PAIR_BRIDGE_MAX_BBOX_GAP:
+                continue
+            if not gap.get("axis_aligned") and distance > 80:
+                continue
+            seen_pairs.add(pair)
+            after = _metrics_for_merge(topology, [left_id, right_id])
+            validation = validate_topology_candidate("single_pin_stub_bridge", before, after)
+            score = _score_single_pin_stub_bridge_candidate(
+                before,
+                after,
+                gap,
+                min(left_score, right_score),
+                1,
+                agent_audit,
+            )
+            score = round(min(0.95, score + 0.1), 3)
+            risk = _risk_level_for_validation(validation, score)
+            target_pins = sorted(set(_node_pin_ids(left_node) + _node_pin_ids(right_node)))
+            candidates.append(
+                {
+                    "candidate_id": f"STB{candidate_index}",
+                    "repair_type": "single_pin_stub_bridge",
+                    "summary": f"Dry-run bridge single-pin pair {left_id} + {right_id}.",
+                    "target_nodes": [left_id, right_id],
+                    "affected_nets": [left_id, right_id],
+                    "target_pins": target_pins,
+                    "target_component_id": None,
+                    "geometry": {
+                        "bridge_mode": "single_pin_pair",
+                        "bbox_gap": gap,
+                        "source_bbox": left_node.get("bbox"),
+                        "target_bbox": right_node.get("bbox"),
+                        "source_node_id": left_id,
+                        "target_node_id": right_id,
+                    },
+                    "before_metrics": before,
+                    "after_metrics": after,
+                    "validation": validation,
+                    "improved_metrics": validation["improved_metrics"],
+                    "regressed_metrics": validation["regressed_metrics"],
+                    "validation_result": validation["validation_result"],
+                    "blocking_issues": validation["blocking_issues"],
+                    "score": score,
+                    "risk_level": risk,
+                    "reasons": [
+                        f"Both {left_id} and {right_id} are single-pin terminal stubs.",
+                        f"BBox gap is {round(distance, 3)} px.",
+                        "The two stubs belong to different components.",
+                        f"Attachment scores are {round(left_score, 3)} and {round(right_score, 3)}.",
+                        f"Single-pin net count changes {before['single_pin_net_count']} -> {after['single_pin_net_count']}.",
+                    ],
+                    "evidence": {
+                        "bridge_mode": "single_pin_pair",
+                        "left_node": {
+                            "node_id": left_id,
+                            "pin_ids": _node_pin_ids(left_node),
+                            "bbox": left_node.get("bbox"),
+                            "segment_ids": left_node.get("segment_ids", []),
+                        },
+                        "right_node": {
+                            "node_id": right_id,
+                            "pin_ids": _node_pin_ids(right_node),
+                            "bbox": right_node.get("bbox"),
+                            "segment_ids": right_node.get("segment_ids", []),
+                        },
+                        "left_terminal_attachment": left_attachment,
+                        "right_terminal_attachment": right_attachment,
+                    },
+                    "mutates_topology": False,
+                }
+            )
+            candidate_index += 1
+
     return candidates[:SINGLE_PIN_STUB_BRIDGE_MAX_CANDIDATES]
 
 
@@ -1500,7 +1675,11 @@ def _candidate_matches_arguments(candidate: dict[str, Any], arguments: dict[str,
     target_axis = str(arguments.get("target_axis") or arguments.get("alternate_axis") or "").strip()
     pin_id = str(arguments.get("pin_id") or "").strip()
     target_node_id = str(arguments.get("target_node_id") or arguments.get("node_id") or "").strip()
-    raw_node_ids = arguments.get("node_ids", [])
+    raw_node_ids = arguments.get("node_ids", []) or arguments.get("target_node_ids", [])
+    if not raw_node_ids and arguments.get("node_id_1") and arguments.get("node_id_2"):
+        raw_node_ids = [arguments.get("node_id_1"), arguments.get("node_id_2")]
+    if not raw_node_ids and arguments.get("node_id") and arguments.get("target_node_id"):
+        raw_node_ids = [arguments.get("node_id"), arguments.get("target_node_id")]
     if raw_node_ids is None:
         raw_node_ids = []
     if not isinstance(raw_node_ids, list):

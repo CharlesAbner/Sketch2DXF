@@ -117,13 +117,14 @@ Available tool meanings:
 - inspect_component_terminal_axis: inspect a component's current pin axis and
   attachment evidence.
 - inspect_gap_bridge_candidates: inspect candidate evidence gaps between graph nodes.
-- inspect_single_pin_stub: inspect single-pin terminal stubs and nearby
-  supported nodes.
+- inspect_single_pin_stub: inspect single-pin terminal stubs, nearby supported
+  nodes, and nearby single-pin stubs that may form a pair bridge.
 - dry_run_component_class_override: validate one class-change hypothesis.
 - dry_run_component_axis_flip: validate one component-axis hypothesis.
 - dry_run_reattach_pin: validate one pin reattachment hypothesis.
 - dry_run_gap_bridge_merge: validate one gap-bridge merge hypothesis.
-- dry_run_single_pin_stub_bridge: validate one single-pin stub bridge hypothesis.
+- dry_run_single_pin_stub_bridge: validate one single-pin stub bridge hypothesis,
+  including supported-node targets or single-pin pair targets.
 - dry_run_merge_nodes: validate one node-merge hypothesis.
 - validate_candidate: re-read validation/ranking details for a previously
   returned candidate.
@@ -175,6 +176,9 @@ Strict rules:
 - confirmed_by_artifacts must contain only facts present in the payload.
 - Prefer candidates that are supported by an explicit hypothesis and a matching
   dry-run result.
+- If multiple viable applyable candidates address different unresolved issues,
+  include them as separate repair_plan steps, or explicitly explain why each
+  omitted viable candidate is not selected.
 
 Required JSON keys:
 - final_decision: one of repair_candidate_ready_for_human_review,
@@ -190,6 +194,16 @@ Required JSON keys:
 - next_actions: list[str]
 - hypothesis_assessment: list of {"hypothesis_id": str, "status": str,
   "reason": str}
+"""
+
+
+REVIEWER_RETRY_PROMPT = REVIEWER_SYSTEM_PROMPT + """
+
+You are reviewing your previous answer. The controller found viable applyable
+candidates that were not included in repair_plan. Reconsider the full plan.
+If an omitted candidate fixes a separate issue without conflicting with selected
+steps, include it. If you still omit it, give an artifact-based reason in
+hypothesis_assessment or risks.
 """
 
 
@@ -814,6 +828,11 @@ def _inspect_single_pin_stub(debug_dir: Path, arguments: dict[str, Any]) -> dict
         for node in nodes.values()
         if len(set(_as_id_list(node.get("pin_ids")))) >= 2
     ]
+    single_pin_targets = [
+        node
+        for node in nodes.values()
+        if len(set(_as_id_list(node.get("pin_ids")))) == 1
+    ]
     for node_id, node in nodes.items():
         pin_ids = _as_id_list(node.get("pin_ids"))
         if len(set(pin_ids)) != 1:
@@ -844,6 +863,30 @@ def _inspect_single_pin_stub(debug_dir: Path, arguments: dict[str, Any]) -> dict
                 }
             )
         nearby.sort(key=lambda item: float(item.get("bbox_gap", {}).get("distance") or 999999.0))
+        nearby_single = []
+        for target in single_pin_targets:
+            target_id = str(target.get("node_id"))
+            if target_id == node_id:
+                continue
+            if set(_as_id_list(target.get("component_ids"))).intersection(_as_id_list(node.get("component_ids"))):
+                continue
+            gap = _bbox_gap_summary(node.get("bbox"), target.get("bbox"))
+            distance = gap.get("distance")
+            if distance is None or float(distance) > 160:
+                continue
+            nearby_single.append(
+                {
+                    "node_id": target_id,
+                    "pin_count": 1,
+                    "pin_ids": target.get("pin_ids", []),
+                    "component_ids": target.get("component_ids", []),
+                    "bbox": target.get("bbox"),
+                    "bbox_gap": gap,
+                    "raw_component_ids": target.get("raw_component_ids", []),
+                    "segment_ids": target.get("segment_ids", []),
+                }
+            )
+        nearby_single.sort(key=lambda item: float(item.get("bbox_gap", {}).get("distance") or 999999.0))
         stubs.append(
             {
                 "node_id": node_id,
@@ -855,6 +898,7 @@ def _inspect_single_pin_stub(debug_dir: Path, arguments: dict[str, Any]) -> dict
                 "segment_ids": node.get("segment_ids", []),
                 "attachment": attachments_by_pin.get(pin_id),
                 "nearby_supported_nodes": nearby[:5],
+                "nearby_single_pin_nodes": nearby_single[:5],
             }
         )
     return {
@@ -1067,7 +1111,7 @@ def _available_tools() -> list[dict[str, Any]]:
         {
             "tool_name": "inspect_single_pin_stub",
             "kind": "read_only",
-            "description": "Inspect one-pin terminal stubs and nearby supported node evidence.",
+            "description": "Inspect one-pin terminal stubs, nearby supported nodes, and nearby one-pin stub pairs.",
         },
         {
             "tool_name": "dry_run_component_class_override",
@@ -1077,7 +1121,7 @@ def _available_tools() -> list[dict[str, Any]]:
         {
             "tool_name": "dry_run_component_axis_flip",
             "kind": "dry_run",
-            "description": "Validate one component terminal axis flip hypothesis without mutating outputs.",
+            "description": "Validate one component terminal axis flip hypothesis; may use nearest-node reattachment when direct terminal evidence is missing.",
         },
         {
             "tool_name": "dry_run_reattach_pin",
@@ -1092,7 +1136,7 @@ def _available_tools() -> list[dict[str, Any]]:
         {
             "tool_name": "dry_run_single_pin_stub_bridge",
             "kind": "dry_run",
-            "description": "Validate one single-pin stub bridge hypothesis without mutating outputs.",
+            "description": "Validate one single-pin stub bridge or single-pin pair bridge hypothesis without mutating outputs.",
         },
         {
             "tool_name": "dry_run_merge_nodes",
@@ -1136,6 +1180,7 @@ def _available_tool_families() -> list[dict[str, Any]]:
                 "a net has exactly one attached pin",
                 "an open question mentions an isolated pin, one-pin stub, or nearby supported node",
                 "a terminal appears to stop near a valid wire node but is not electrically merged",
+                "two one-pin stubs appear to be separated parts of the same intended bus",
             ],
             "typical_sequence": [
                 "inspect_single_pin_stub",
@@ -1705,6 +1750,41 @@ def _planner_self_consistency_feedback(
     return feedback
 
 
+def _nearby_single_pin_pair_from_results(tool_results: list[dict[str, Any]]) -> list[str]:
+    for result in reversed(tool_results):
+        if result.get("tool_name") != "inspect_single_pin_stub":
+            continue
+        for stub in result.get("result_summary", {}).get("stubs", []):
+            node_id = str(stub.get("node_id") or "").strip()
+            if not node_id:
+                continue
+            nearby = stub.get("nearby_single_pin_nodes", [])
+            if not nearby:
+                continue
+            target_id = str(nearby[0].get("node_id") or "").strip()
+            if target_id and target_id != node_id:
+                return [node_id, target_id]
+    return []
+
+
+def _single_pin_pair_feedback(
+    tool_calls: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+    completed_tool_names: set[str],
+) -> list[str]:
+    if tool_calls or "dry_run_merge_nodes" in completed_tool_names:
+        return []
+    pair = _nearby_single_pin_pair_from_results(tool_results)
+    if not pair:
+        return []
+    return [
+        "A nearby single-pin pair was found by inspect_single_pin_stub "
+        f"({pair[0]} and {pair[1]}), but no dry_run_merge_nodes call tested that "
+        "pair. Before final_ready, either call dry_run_merge_nodes with "
+        f"node_ids={pair} or defer it with a concrete artifact-based reason."
+    ]
+
+
 def _plan_tool_calls(
     audit_report: dict[str, Any] | None,
     observation: dict[str, Any],
@@ -1800,6 +1880,13 @@ def _plan_tool_calls(
             tool_calls,
             open_questions,
             deferred_questions,
+            completed_tool_names,
+        )
+    )
+    guard_feedback.extend(
+        _single_pin_pair_feedback(
+            tool_calls,
+            tool_results,
             completed_tool_names,
         )
     )
@@ -2102,7 +2189,13 @@ def _ground_tool_call_arguments(
                 break
 
     if tool_name == "dry_run_single_pin_stub_bridge":
-        if not arguments.get("pin_id") or not arguments.get("target_node_id"):
+        explicit_node_pair = bool(
+            _as_id_list(arguments.get("node_ids"))
+            or _as_id_list(arguments.get("target_node_ids"))
+            or (arguments.get("node_id_1") and arguments.get("node_id_2"))
+            or (arguments.get("node_id") and arguments.get("target_node_id"))
+        )
+        if not explicit_node_pair and (not arguments.get("pin_id") or not arguments.get("target_node_id")):
             for result in reversed(tool_results):
                 if result.get("tool_name") != "inspect_single_pin_stub":
                     continue
@@ -2123,6 +2216,19 @@ def _ground_tool_call_arguments(
                     arguments["node_ids"] = [stub.get("node_id"), nearby[0].get("node_id")]
                     added["node_ids"] = arguments["node_ids"]
                 break
+
+    if tool_name == "dry_run_merge_nodes":
+        explicit_node_pair = bool(
+            _as_id_list(arguments.get("node_ids"))
+            or _as_id_list(arguments.get("target_node_ids"))
+            or (arguments.get("node_id_1") and arguments.get("node_id_2"))
+            or (arguments.get("node_id") and arguments.get("target_node_id"))
+        )
+        if not explicit_node_pair:
+            pair = _nearby_single_pin_pair_from_results(tool_results)
+            if pair:
+                arguments["node_ids"] = pair
+                added["node_ids"] = pair
 
     grounding = {
         "applied": bool(added),
@@ -2540,6 +2646,37 @@ def _normalize_review_content(
     }
 
 
+def _omitted_viable_applyable_candidates(
+    repair_plan: dict[str, Any] | None,
+    tool_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_ids = set(_repair_plan_candidate_ids(repair_plan))
+    omitted = []
+    for candidate in _candidate_pool_from_tool_results(tool_results):
+        candidate_id = str(candidate.get("candidate_id") or candidate.get("repair_candidate_id") or "")
+        if not candidate_id or candidate_id in selected_ids:
+            continue
+        if candidate.get("candidate_mode") != "applyable":
+            continue
+        if candidate.get("validation_result") != "viable":
+            continue
+        if candidate.get("recommendation") != "accept_for_human_review":
+            continue
+        omitted.append(
+            {
+                "candidate_id": candidate_id,
+                "repair_type": candidate.get("repair_type"),
+                "hypothesis_id": candidate.get("hypothesis_id") or candidate.get("geometry", {}).get("hypothesis_id"),
+                "ranking_score": candidate.get("ranking_score") or candidate.get("ranking", {}).get("ranking_score"),
+                "target_nodes": candidate.get("target_nodes", []),
+                "target_pins": candidate.get("target_pins", []),
+                "improved_metrics": candidate.get("improved_metrics", []),
+                "summary": candidate.get("summary"),
+            }
+        )
+    return omitted[:5]
+
+
 def _review_tool_results(
     audit_report: dict[str, Any] | None,
     observation: dict[str, Any],
@@ -2603,6 +2740,51 @@ def _review_tool_results(
         return fallback
     candidate_lookup = _candidate_lookup_from_tool_results(tool_results)
     normalized = _normalize_review_content(content, _known_candidate_ids(tool_results), fallback, candidate_lookup)
+    omitted = _omitted_viable_applyable_candidates(normalized.get("repair_plan"), tool_results)
+    if omitted:
+        retry_payload = {
+            **payload,
+            "previous_reviewer_content": content,
+            "reviewer_retry_feedback": {
+                "reason": "viable_applyable_candidates_omitted_from_repair_plan",
+                "omitted_candidates": omitted,
+                "instruction": (
+                    "Reconsider repair_plan. Include non-conflicting omitted candidates "
+                    "that fix separate issues, or explain why each is omitted."
+                ),
+            },
+        }
+        retry_result = complete_json(
+            REVIEWER_RETRY_PROMPT,
+            retry_payload,
+            backend=backend,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            api_key_env=api_key_env,
+        )
+        retry_content = retry_result.get("content", {}) if isinstance(retry_result.get("content"), dict) else {}
+        if retry_result.get("used") and not retry_result.get("error"):
+            retry_normalized = _normalize_review_content(
+                retry_content,
+                _known_candidate_ids(tool_results),
+                fallback,
+                candidate_lookup,
+            )
+            retry_normalized["reviewer_retry"] = {
+                "used": True,
+                "reason": "viable_applyable_candidates_omitted_from_repair_plan",
+                "omitted_candidate_count": len(omitted),
+                "llm_result": retry_result,
+            }
+            normalized = retry_normalized
+        else:
+            normalized["reviewer_retry"] = {
+                "used": False,
+                "reason": "retry_llm_unavailable",
+                "omitted_candidate_count": len(omitted),
+                "llm_result": retry_result,
+            }
     if not normalized.get("selected_hypothesis_ids"):
         normalized["selected_hypothesis_ids"] = _hypothesis_ids_from_candidate_ids(
             tool_results,

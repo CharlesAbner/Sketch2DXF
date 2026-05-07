@@ -15,16 +15,60 @@ from src.io_utils.json_io import save_json
 
 
 LAYER_DEFS = {
-    "WIRES": {"color": 2, "lineweight": 25},
+    "WIRES": {"color": 7, "lineweight": 30},
     "COMPONENTS": {"color": 7, "lineweight": 35},
     "LABELS": {"color": 3, "lineweight": 18},
     "NETS": {"color": 5, "lineweight": 18},
     "PINS": {"color": 1, "lineweight": 13},
     "NODES": {"color": 6, "lineweight": 18},
-    "JUNCTIONS": {"color": 6, "lineweight": 30},
+    "JUNCTIONS": {"color": 7, "lineweight": 35},
     "TITLE": {"color": 8, "lineweight": 13},
     "REPAIR": {"color": 30, "lineweight": 13},
 }
+
+RESISTOR_BODY_LENGTH = 54.0
+RESISTOR_ZIGZAG_WIDTH = 8.0
+CAPACITOR_PLATE_LENGTH = 32.0
+CAPACITOR_GAP = 5.0
+SOURCE_LONG_PLATE = 36.0
+SOURCE_SHORT_PLATE = 22.0
+SOURCE_GAP = 6.0
+BOX_BODY_LENGTH = 46.0
+BOX_BODY_WIDTH = 18.0
+
+
+def _unit_axis(p1: tuple[float, float], p2: tuple[float, float], axis: str) -> tuple[float, float]:
+    if axis == "vertical":
+        return (0.0, 1.0 if p2[1] >= p1[1] else -1.0)
+    return (1.0 if p2[0] >= p1[0] else -1.0, 0.0)
+
+
+def _axis_span(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    axis: str,
+    body_length: float,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    ux, uy = _unit_axis(p1, p2, axis)
+    if axis == "vertical":
+        center = (p1[0], (p1[1] + p2[1]) / 2.0)
+    else:
+        center = ((p1[0] + p2[0]) / 2.0, p1[1])
+    half = min(body_length / 2.0, max(abs(p2[0] - p1[0]), abs(p2[1] - p1[1])) * 0.42)
+    start = (center[0] - ux * half, center[1] - uy * half)
+    end = (center[0] + ux * half, center[1] + uy * half)
+    return center, start, end
+
+
+def _draw_leads(
+    msp,
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    body_start: tuple[float, float],
+    body_end: tuple[float, float],
+) -> None:
+    msp.add_line(p1, body_start, dxfattribs={"layer": "COMPONENTS"})
+    msp.add_line(body_end, p2, dxfattribs={"layer": "COMPONENTS"})
 
 
 def _export_cfg(config: dict) -> dict:
@@ -63,11 +107,13 @@ def _segment_points(
 
 
 def _draw_resistor(msp, p1: tuple[float, float], p2: tuple[float, float], axis: str) -> None:
+    _, body_start, body_end = _axis_span(p1, p2, axis, RESISTOR_BODY_LENGTH)
+    _draw_leads(msp, p1, p2, body_start, body_end)
     if axis == "vertical":
-        x = p1[0]
-        y1, y2 = sorted([p1[1], p2[1]])
+        x = body_start[0]
+        y1, y2 = body_start[1], body_end[1]
         step = (y2 - y1) / 6.0
-        width = max(4.0, abs(y2 - y1) * 0.12)
+        width = RESISTOR_ZIGZAG_WIDTH
         points = [
             (x, y1),
             (x - width, y1 + step),
@@ -78,10 +124,10 @@ def _draw_resistor(msp, p1: tuple[float, float], p2: tuple[float, float], axis: 
             (x, y2),
         ]
     else:
-        y = p1[1]
-        x1, x2 = sorted([p1[0], p2[0]])
+        y = body_start[1]
+        x1, x2 = body_start[0], body_end[0]
         step = (x2 - x1) / 6.0
-        height = max(4.0, abs(x2 - x1) * 0.12)
+        height = RESISTOR_ZIGZAG_WIDTH
         points = [
             (x1, y),
             (x1 + step, y + height),
@@ -95,58 +141,46 @@ def _draw_resistor(msp, p1: tuple[float, float], p2: tuple[float, float], axis: 
 
 
 def _draw_capacitor(msp, p1: tuple[float, float], p2: tuple[float, float], axis: str) -> None:
+    center, _, _ = _axis_span(p1, p2, axis, CAPACITOR_PLATE_LENGTH)
+    ux, uy = _unit_axis(p1, p2, axis)
+    lead_a = (center[0] - ux * CAPACITOR_GAP, center[1] - uy * CAPACITOR_GAP)
+    lead_b = (center[0] + ux * CAPACITOR_GAP, center[1] + uy * CAPACITOR_GAP)
+    _draw_leads(msp, p1, p2, lead_a, lead_b)
     if axis == "vertical":
-        x = p1[0]
-        y1, y2 = sorted([p1[1], p2[1]])
-        mid = (y1 + y2) / 2.0
-        gap = max(3.0, abs(y2 - y1) * 0.08)
-        half_width = max(6.0, abs(y2 - y1) * 0.18)
-        msp.add_line((x, y1), (x, mid + gap), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((x, mid - gap), (x, y2), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((x - half_width, mid + gap), (x + half_width, mid + gap), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((x - half_width, mid - gap), (x + half_width, mid - gap), dxfattribs={"layer": "COMPONENTS"})
+        x = center[0]
+        half_width = CAPACITOR_PLATE_LENGTH / 2.0
+        msp.add_line((x - half_width, lead_a[1]), (x + half_width, lead_a[1]), dxfattribs={"layer": "COMPONENTS"})
+        msp.add_line((x - half_width, lead_b[1]), (x + half_width, lead_b[1]), dxfattribs={"layer": "COMPONENTS"})
     else:
-        y = p1[1]
-        x1, x2 = sorted([p1[0], p2[0]])
-        mid = (x1 + x2) / 2.0
-        gap = max(3.0, abs(x2 - x1) * 0.08)
-        half_height = max(6.0, abs(x2 - x1) * 0.18)
-        msp.add_line((x1, y), (mid - gap, y), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((mid + gap, y), (x2, y), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((mid - gap, y - half_height), (mid - gap, y + half_height), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((mid + gap, y - half_height), (mid + gap, y + half_height), dxfattribs={"layer": "COMPONENTS"})
+        y = center[1]
+        half_height = CAPACITOR_PLATE_LENGTH / 2.0
+        msp.add_line((lead_a[0], y - half_height), (lead_a[0], y + half_height), dxfattribs={"layer": "COMPONENTS"})
+        msp.add_line((lead_b[0], y - half_height), (lead_b[0], y + half_height), dxfattribs={"layer": "COMPONENTS"})
 
 
 def _draw_power_source(msp, p1: tuple[float, float], p2: tuple[float, float], axis: str) -> None:
+    center, _, _ = _axis_span(p1, p2, axis, SOURCE_LONG_PLATE)
+    ux, uy = _unit_axis(p1, p2, axis)
+    lead_a = (center[0] - ux * SOURCE_GAP, center[1] - uy * SOURCE_GAP)
+    lead_b = (center[0] + ux * SOURCE_GAP, center[1] + uy * SOURCE_GAP)
+    _draw_leads(msp, p1, p2, lead_a, lead_b)
     if axis == "vertical":
-        x = p1[0]
-        y1, y2 = sorted([p1[1], p2[1]])
-        mid = (y1 + y2) / 2.0
-        gap = max(3.0, abs(y2 - y1) * 0.08)
-        short_half = max(4.0, abs(y2 - y1) * 0.10)
-        long_half = max(7.0, abs(y2 - y1) * 0.18)
-        msp.add_line((x, y1), (x, mid + gap), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((x, mid - gap), (x, y2), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((x - long_half, mid + gap), (x + long_half, mid + gap), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((x - short_half, mid - gap), (x + short_half, mid - gap), dxfattribs={"layer": "COMPONENTS"})
+        x = center[0]
+        msp.add_line((x - SOURCE_LONG_PLATE / 2.0, lead_a[1]), (x + SOURCE_LONG_PLATE / 2.0, lead_a[1]), dxfattribs={"layer": "COMPONENTS"})
+        msp.add_line((x - SOURCE_SHORT_PLATE / 2.0, lead_b[1]), (x + SOURCE_SHORT_PLATE / 2.0, lead_b[1]), dxfattribs={"layer": "COMPONENTS"})
     else:
-        y = p1[1]
-        x1, x2 = sorted([p1[0], p2[0]])
-        mid = (x1 + x2) / 2.0
-        gap = max(3.0, abs(x2 - x1) * 0.08)
-        short_half = max(4.0, abs(x2 - x1) * 0.10)
-        long_half = max(7.0, abs(x2 - x1) * 0.18)
-        msp.add_line((x1, y), (mid - gap, y), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((mid + gap, y), (x2, y), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((mid - gap, y - short_half), (mid - gap, y + short_half), dxfattribs={"layer": "COMPONENTS"})
-        msp.add_line((mid + gap, y - long_half), (mid + gap, y + long_half), dxfattribs={"layer": "COMPONENTS"})
+        y = center[1]
+        msp.add_line((lead_a[0], y - SOURCE_SHORT_PLATE / 2.0), (lead_a[0], y + SOURCE_SHORT_PLATE / 2.0), dxfattribs={"layer": "COMPONENTS"})
+        msp.add_line((lead_b[0], y - SOURCE_LONG_PLATE / 2.0), (lead_b[0], y + SOURCE_LONG_PLATE / 2.0), dxfattribs={"layer": "COMPONENTS"})
 
 
 def _draw_box(msp, p1: tuple[float, float], p2: tuple[float, float], axis: str) -> None:
+    _, body_start, body_end = _axis_span(p1, p2, axis, BOX_BODY_LENGTH)
+    _draw_leads(msp, p1, p2, body_start, body_end)
     if axis == "vertical":
-        x = p1[0]
-        y1, y2 = sorted([p1[1], p2[1]])
-        half_width = max(6.0, abs(y2 - y1) * 0.18)
+        x = body_start[0]
+        y1, y2 = sorted([body_start[1], body_end[1]])
+        half_width = BOX_BODY_WIDTH / 2.0
         points = [
             (x - half_width, y1),
             (x - half_width, y2),
@@ -155,9 +189,9 @@ def _draw_box(msp, p1: tuple[float, float], p2: tuple[float, float], axis: str) 
             (x - half_width, y1),
         ]
     else:
-        y = p1[1]
-        x1, x2 = sorted([p1[0], p2[0]])
-        half_height = max(6.0, abs(x2 - x1) * 0.18)
+        y = body_start[1]
+        x1, x2 = sorted([body_start[0], body_end[0]])
+        half_height = BOX_BODY_WIDTH / 2.0
         points = [
             (x1, y - half_height),
             (x2, y - half_height),
@@ -179,7 +213,7 @@ def _draw_component_symbol(msp, component: dict, pin_group: dict, max_y: float) 
     p2 = _cad_point(pins[1]["x"], pins[1]["y"], max_y)
     primitive = symbol.get("primitive", "box")
     if primitive == "resistor":
-        _draw_resistor(msp, p1, p2, axis)
+        _draw_box(msp, p1, p2, axis)
     elif primitive == "capacitor":
         _draw_capacitor(msp, p1, p2, axis)
     elif primitive == "power_source":
@@ -191,8 +225,8 @@ def _draw_component_symbol(msp, component: dict, pin_group: dict, max_y: float) 
 def _component_label_anchor(component: dict, axis: str, max_y: float) -> tuple[float, float]:
     x1, y1, x2, y2 = component["bbox"]
     if axis == "vertical":
-        return _cad_point((x1 + x2) / 2.0 + 10.0, y1, max_y)
-    return _cad_point(x1, y1 - 12.0, max_y)
+        return _cad_point(x2 + 12.0, (y1 + y2) / 2.0 - 10.0, max_y)
+    return _cad_point((x1 + x2) / 2.0 - 10.0, y1 - 16.0, max_y)
 
 
 def _add_text(msp, text: str, point: tuple[float, float], height: float, layer: str) -> None:
@@ -235,7 +269,14 @@ def _draw_junction_dots(msp, nodes: list[dict], max_y: float) -> None:
         if pin_count < 3 and component_count < 3 and not has_junction:
             continue
         x, y = _cad_point(node.get("x", 0), node.get("y", 0), max_y)
-        msp.add_circle((x, y), radius=2.8, dxfattribs={"layer": "JUNCTIONS"})
+        msp.add_circle((x, y), radius=3.2, dxfattribs={"layer": "JUNCTIONS"})
+        try:
+            msp.add_solid(
+                [(x - 2.2, y), (x, y + 2.2), (x + 2.2, y), (x, y - 2.2)],
+                dxfattribs={"layer": "JUNCTIONS"},
+            )
+        except Exception:
+            pass
 
 
 def _drawing_bounds(topology: dict, max_y: float) -> tuple[float, float, float, float]:
@@ -350,7 +391,7 @@ def export_to_dxf(topology_result: dict, config: dict) -> dict:
             if _export_bool(config, "dxf_show_component_labels", True, True):
                 label_x, label_y = _component_label_anchor(component, axis, max_y)
                 label = component.get("refdes", component_id)
-                _add_text(msp, label, (label_x, label_y), 5.0 if _is_clean_mode(config) else 6.0, "LABELS")
+                _add_text(msp, label, (label_x, label_y), 6.0 if _is_clean_mode(config) else 6.0, "LABELS")
 
         if _export_bool(config, "dxf_show_junction_dots", True, True):
             _draw_junction_dots(msp, nodes, max_y)
