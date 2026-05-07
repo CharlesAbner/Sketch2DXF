@@ -7,6 +7,15 @@ from typing import Any
 
 RANKER_VERSION = "3.1-step4-repair-candidate-ranker"
 
+APPLYABLE_REPAIR_TYPES = {
+    "merge_nodes",
+    "reattach_pin",
+    "gap_bridge_merge",
+    "single_pin_stub_bridge",
+    "component_pin_axis_flip",
+    "component_class_override",
+}
+
 VALIDATION_PRIORITY = {
     "viable": 0.45,
     "reviewable": 0.25,
@@ -20,6 +29,7 @@ RISK_PENALTY = {
 }
 
 IMPROVEMENT_WEIGHTS = {
+    "power_source_count": 0.3,
     "source_terminal_short_count": 0.4,
     "zero_pin_net_count": 0.35,
     "unmatched_pin_count": 0.3,
@@ -124,6 +134,9 @@ def rank_repair_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     ranked["ranking_score"] = ranking_score
     ranked["recommendation"] = recommendation
     ranked["ranking_reasons"] = reasons
+    ranked["candidate_mode"] = (
+        "applyable" if ranked.get("repair_type") in APPLYABLE_REPAIR_TYPES else "review_only"
+    )
     return ranked
 
 

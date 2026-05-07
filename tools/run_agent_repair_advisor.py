@@ -133,7 +133,7 @@ def main() -> None:
                 "trace_step_count": len(report.get("agent_trace", [])),
                 "trace_steps": [item.get("step") for item in report.get("agent_trace", [])],
                 "final_decision": report.get("final_decision"),
-                "selected_candidate_ids": report.get("selected_candidate_ids"),
+                "repair_plan": report.get("repair_plan"),
                 "topology_mutated": report.get("topology_mutated"),
                 "outputs": result["outputs"],
             },

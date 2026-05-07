@@ -9,21 +9,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.config import get_default_config
 from src.agent_workflow.candidate_validator import (
     VALIDATOR_VERSION,
     validate_topology_candidate,
 )
 from src.agent_workflow.candidate_ranker import RANKER_VERSION, rank_repair_candidates
+from src.topology.terminal_attachment import build_terminal_attachments
+from src.topology.symbol_library import get_symbol_definition
 
 
 PROTECTED_OUTPUT_FILES = ("topology.json", "netlist.json", "14_export.dxf")
 MERGE_NODE_MAX_BBOX_GAP = 80.0
 MERGE_NODE_MAX_CANDIDATES = 8
 REATTACH_PIN_MAX_CANDIDATES = 8
+AXIS_FLIP_MAX_CANDIDATES = 8
+CLASS_OVERRIDE_MAX_CANDIDATES = 8
 EVIDENCE_REVIEW_MAX_CANDIDATES = 8
+GAP_BRIDGE_MERGE_MAX_CANDIDATES = 8
+SINGLE_PIN_STUB_BRIDGE_MAX_CANDIDATES = 8
+SINGLE_PIN_STUB_BRIDGE_MAX_BBOX_GAP = 90.0
 REPAIR_DRY_RUN_MAX_CANDIDATES = 16
 REATTACH_PIN_MIN_ATTACHMENT_SCORE = 0.55
 REATTACH_PIN_WEAK_CONFIDENCE = 0.75
+STUB_BRIDGE_MIN_ATTACHMENT_SCORE = 0.55
+GRANULAR_DRY_RUN_TOOLS = {
+    "dry_run_merge_nodes",
+    "dry_run_component_class_override",
+    "dry_run_component_axis_flip",
+    "dry_run_reattach_pin",
+    "dry_run_gap_bridge_merge",
+    "dry_run_single_pin_stub_bridge",
+}
 REQUIRED_DEBUG_ARTIFACTS = (
     "case_summary.json",
     "audit_inputs.json",
@@ -119,9 +136,11 @@ def _metrics_for_merge(
     topology: dict[str, Any],
     merge_nodes: list[str] | None = None,
     pin_node_overrides: dict[str, str] | None = None,
+    class_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     merge_nodes = merge_nodes or []
     pin_node_overrides = pin_node_overrides or {}
+    class_overrides = class_overrides or {}
     parent: dict[str, str] = {}
     for node in topology.get("nodes", []):
         node_id = str(node.get("node_id"))
@@ -133,6 +152,9 @@ def _metrics_for_merge(
 
     pin_to_component = _pin_component_lookup(topology)
     component_classes = _component_class_lookup(topology)
+    for component_id, class_name in class_overrides.items():
+        component_classes[str(component_id)] = str(class_name).lower()
+    all_pins = _all_pin_ids(topology)
     net_pins: dict[str, list[dict[str, str]]] = {}
     connected_pin_ids: set[str] = set()
     for connection in topology.get("connections", []):
@@ -149,7 +171,23 @@ def _metrics_for_merge(
             }
         )
 
-    all_pins = _all_pin_ids(topology)
+    for pin_id, node_id in pin_node_overrides.items():
+        pin_id = str(pin_id)
+        if pin_id in connected_pin_ids or pin_id not in all_pins:
+            continue
+        component_id = str(pin_to_component.get(pin_id, ""))
+        if not component_id:
+            continue
+        parent.setdefault(str(node_id), str(node_id))
+        merged_node_id = _find(parent, str(node_id))
+        connected_pin_ids.add(pin_id)
+        net_pins.setdefault(merged_node_id, []).append(
+            {
+                "pin_id": pin_id,
+                "component_id": component_id,
+            }
+        )
+
     unmatched_pin_ids = sorted(pin_id for pin_id in all_pins if pin_id not in connected_pin_ids)
     zero_pin_net_ids = sorted(node_id for node_id in parent if _find(parent, node_id) not in net_pins)
     single_pin_net_ids = sorted(
@@ -203,6 +241,8 @@ def _metrics_for_merge(
     return {
         "node_count": len(set(_find(parent, node_id) for node_id in parent)),
         "net_count": len(net_pins),
+        "power_source_count": sum(1 for class_name in component_classes.values() if _is_power_class(class_name)),
+        "has_power_source": any(_is_power_class(class_name) for class_name in component_classes.values()),
         "single_pin_net_count": len(single_pin_net_ids),
         "single_pin_net_ids": single_pin_net_ids,
         "zero_pin_net_count": len(zero_pin_net_ids),
@@ -553,6 +593,418 @@ def _generate_reattach_pin_candidates(
     return candidates[:REATTACH_PIN_MAX_CANDIDATES]
 
 
+def _component_lookup(topology: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(component.get("id")): component for component in topology.get("components", [])}
+
+
+def _pin_group_lookup(topology: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(group.get("component_id")): group
+        for group in topology.get("pins", [])
+        if group.get("component_id")
+    }
+
+
+def _pin_ids_for_component(topology: dict[str, Any], component_id: str) -> list[str]:
+    for group in topology.get("pins", []):
+        if str(group.get("component_id")) != component_id:
+            continue
+        return [
+            str(pin.get("pin_id"))
+            for pin in group.get("pins", [])
+            if pin.get("pin_id")
+        ]
+    return []
+
+
+def _node_ids_for_component(topology: dict[str, Any], component_id: str) -> list[str]:
+    return sorted(
+        {
+            str(connection.get("node_id"))
+            for connection in topology.get("connections", [])
+            if str(connection.get("component_id")) == component_id and connection.get("node_id")
+        }
+    )
+
+
+def _symbol_pin_count(class_name: str) -> int:
+    return int(get_symbol_definition(class_name).get("pin_count", 0) or 0)
+
+
+def _candidate_class_score(component: dict[str, Any], class_name: str) -> float:
+    for candidate in component.get("class_candidates", []):
+        if str(candidate.get("class_name")) == class_name:
+            return float(candidate.get("score", 0.0) or 0.0)
+    for candidate in component.get("class_alternatives", []):
+        if str(candidate.get("class_name")) == class_name:
+            return float(candidate.get("score", 0.0) or 0.0)
+    return 0.0
+
+
+def _component_class_source_candidates(debug_dir: Path) -> dict[str, dict[str, Any]]:
+    payload = _read_json(debug_dir / "repair_candidates.json") or {}
+    result: dict[str, dict[str, Any]] = {}
+    for candidate in payload.get("candidates", []) or []:
+        if str(candidate.get("issue_type")) != "component_class_ambiguity":
+            continue
+        component_id = str(candidate.get("refs", {}).get("component_id", ""))
+        if component_id:
+            result[component_id] = candidate
+    return result
+
+
+def _score_component_class_override(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    component: dict[str, Any],
+    alternative: dict[str, Any],
+    source_candidate: dict[str, Any] | None,
+    agent_audit: dict[str, Any] | None,
+) -> float:
+    score = 0.26
+    alt_class = str(alternative.get("class_name", ""))
+    alt_score = float(alternative.get("score", 0.0) or 0.0)
+    selected_score = _candidate_class_score(component, str(component.get("class_name", "")))
+    if alt_score > 0:
+        score += min(0.18, alt_score * 0.22)
+    if selected_score > 0 and alt_score >= selected_score * 0.35:
+        score += 0.08
+    if _is_power_class(alt_class) and not before.get("has_power_source"):
+        score += 0.28
+    if after.get("power_source_count", 0) > before.get("power_source_count", 0):
+        score += 0.12
+    if source_candidate and source_candidate.get("severity") == "warning":
+        score += 0.06
+    if agent_audit:
+        semantic = agent_audit.get("topology_semantic_audit", {})
+        evidence_codes = {str(item.get("code")) for item in agent_audit.get("evidence", [])}
+        action_types = {str(action.get("action_type")) for action in agent_audit.get("recommended_actions", [])}
+        if semantic.get("circuit_completeness") == "passive_or_missing_power_source":
+            score += 0.08
+        if "missing_power_source" in evidence_codes or "confirm_missing_power_source" in action_types:
+            score += 0.08
+    return round(min(score, 0.95), 3)
+
+
+def _generate_component_class_override_candidates(
+    debug_dir: Path,
+    agent_audit: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    topology = _read_json(debug_dir / "topology.json") or {}
+    before = _metrics_for_merge(topology)
+    source_candidates = _component_class_source_candidates(debug_dir)
+    candidates: list[dict[str, Any]] = []
+    candidate_index = 1
+
+    for component in topology.get("components", []):
+        component_id = str(component.get("id", ""))
+        current_class = str(component.get("class_name", "unknown"))
+        current_pin_count = _symbol_pin_count(current_class)
+        for alternative in component.get("class_alternatives", []) or []:
+            alternate_class = str(alternative.get("class_name", "unknown"))
+            if alternate_class == current_class:
+                continue
+            alternate_pin_count = _symbol_pin_count(alternate_class)
+            if alternate_pin_count != current_pin_count:
+                continue
+
+            after = _metrics_for_merge(
+                topology,
+                class_overrides={component_id: alternate_class},
+            )
+            validation = validate_topology_candidate("component_class_override", before, after)
+            source_candidate = source_candidates.get(component_id)
+            score = _score_component_class_override(
+                before,
+                after,
+                component,
+                alternative,
+                source_candidate,
+                agent_audit,
+            )
+            risk = _risk_level_for_validation(validation, score)
+            if alternate_pin_count == 0:
+                risk = "high"
+            reasons = [
+                f"Current class is {current_class}; alternative class is {alternate_class}.",
+                f"Both classes have compatible pin_count={current_pin_count}.",
+                f"Selected score is {round(_candidate_class_score(component, current_class), 3)}; alternative score is {round(float(alternative.get('score', 0.0) or 0.0), 3)}.",
+                "Dry-run does not change terminal geometry or node topology.",
+            ]
+            if _is_power_class(alternate_class) and not before.get("has_power_source"):
+                reasons.append("The current recovered topology has no power-source component.")
+
+            candidates.append(
+                {
+                    "candidate_id": f"CLS{candidate_index}",
+                    "repair_type": "component_class_override",
+                    "summary": (
+                        f"Dry-run override {component_id} class from {current_class} to {alternate_class}."
+                    ),
+                    "target_nodes": _node_ids_for_component(topology, component_id),
+                    "affected_nets": _node_ids_for_component(topology, component_id),
+                    "target_pins": _pin_ids_for_component(topology, component_id),
+                    "target_component_id": component_id,
+                    "geometry": {
+                        "component_id": component_id,
+                        "bbox": component.get("bbox"),
+                        "current_class_name": current_class,
+                        "alternate_class_name": alternate_class,
+                        "current_pin_count": current_pin_count,
+                        "alternate_pin_count": alternate_pin_count,
+                    },
+                    "before_metrics": before,
+                    "after_metrics": after,
+                    "validation": validation,
+                    "improved_metrics": validation["improved_metrics"],
+                    "regressed_metrics": validation["regressed_metrics"],
+                    "validation_result": validation["validation_result"],
+                    "blocking_issues": validation["blocking_issues"],
+                    "score": score,
+                    "risk_level": risk,
+                    "reasons": reasons,
+                    "evidence": {
+                        "selected_class": {
+                            "class_name": current_class,
+                            "score": _candidate_class_score(component, current_class),
+                        },
+                        "alternative_class": alternative,
+                        "class_candidates": component.get("class_candidates", []),
+                        "source_repair_candidate": source_candidate,
+                    },
+                    "mutates_topology": False,
+                }
+            )
+            candidate_index += 1
+
+    return candidates[:CLASS_OVERRIDE_MAX_CANDIDATES]
+
+
+def _pin_group_for_axis(component: dict[str, Any], current_group: dict[str, Any], axis: str) -> dict[str, Any] | None:
+    bbox = component.get("bbox")
+    current_pins = current_group.get("pins", [])
+    if not bbox or len(bbox) < 4 or len(current_pins) != 2:
+        return None
+    x1, y1, x2, y2 = [int(value) for value in bbox[:4]]
+    cx = int(round((x1 + x2) / 2))
+    cy = int(round((y1 + y2) / 2))
+    pin_ids = [str(pin.get("pin_id")) for pin in current_pins]
+    component_id = str(component.get("id"))
+    if axis == "vertical":
+        pins = [
+            {
+                "pin_id": pin_ids[0],
+                "component_id": component_id,
+                "x": cx,
+                "y": y1,
+                "side": "top",
+                "terminal_role": "top",
+                "axis": "vertical",
+                "axis_source": "agent_axis_flip",
+                "confidence": 0.5,
+            },
+            {
+                "pin_id": pin_ids[1],
+                "component_id": component_id,
+                "x": cx,
+                "y": y2,
+                "side": "bottom",
+                "terminal_role": "bottom",
+                "axis": "vertical",
+                "axis_source": "agent_axis_flip",
+                "confidence": 0.5,
+            },
+        ]
+    else:
+        pins = [
+            {
+                "pin_id": pin_ids[0],
+                "component_id": component_id,
+                "x": x1,
+                "y": cy,
+                "side": "left",
+                "terminal_role": "left",
+                "axis": "horizontal",
+                "axis_source": "agent_axis_flip",
+                "confidence": 0.5,
+            },
+            {
+                "pin_id": pin_ids[1],
+                "component_id": component_id,
+                "x": x2,
+                "y": cy,
+                "side": "right",
+                "terminal_role": "right",
+                "axis": "horizontal",
+                "axis_source": "agent_axis_flip",
+                "confidence": 0.5,
+            },
+        ]
+    return {
+        "component_id": component_id,
+        "pin_count": 2,
+        "axis": axis,
+        "axis_source": "agent_axis_flip",
+        "confidence": 0.5,
+        "pins": pins,
+    }
+
+
+def _score_axis_group(
+    pin_group: dict[str, Any],
+    evidence_graph: dict[str, Any],
+    raw_to_node: dict[str, str],
+) -> dict[str, Any]:
+    attachment_result = build_terminal_attachments(
+        {"pins": [pin_group]},
+        evidence_graph,
+        get_default_config(),
+    )
+    overrides: dict[str, str] = {}
+    attached_scores = []
+    attachments = attachment_result.get("attachments", [])
+    for attachment in attachments:
+        score = float(attachment.get("best_attachment_score", 0.0) or 0.0)
+        raw_component_id = attachment.get("best_raw_component_id")
+        if raw_component_id and str(raw_component_id) in raw_to_node:
+            overrides[str(attachment.get("pin_id"))] = raw_to_node[str(raw_component_id)]
+            attached_scores.append(score)
+    best_scores = [
+        float(attachment.get("best_attachment_score", 0.0) or 0.0)
+        for attachment in attachments
+    ]
+    return {
+        "axis": pin_group.get("axis"),
+        "attached_pin_count": len(overrides),
+        "attachment_score_sum": round(float(sum(best_scores)), 3),
+        "attached_score_sum": round(float(sum(attached_scores)), 3),
+        "min_best_attachment_score": round(float(min(best_scores)), 3) if best_scores else 0.0,
+        "pin_node_overrides": overrides,
+        "attachments": attachments,
+    }
+
+
+def _score_axis_flip_candidate(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    current_score: dict[str, Any],
+    alternate_score: dict[str, Any],
+    current_axis_source: str,
+    agent_audit: dict[str, Any] | None,
+) -> float:
+    score = 0.2
+    attached_delta = int(alternate_score.get("attached_pin_count", 0)) - int(current_score.get("attached_pin_count", 0))
+    attachment_delta = float(alternate_score.get("attached_score_sum", 0.0)) - float(
+        current_score.get("attached_score_sum", 0.0)
+    )
+    unmatched_delta = before["unmatched_pin_count"] - after["unmatched_pin_count"]
+    if current_axis_source == "fallback":
+        score += 0.15
+    if attached_delta > 0:
+        score += min(0.28, attached_delta * 0.14)
+    if attachment_delta > 0:
+        score += min(0.2, attachment_delta * 0.12)
+    if unmatched_delta > 0:
+        score += min(0.24, unmatched_delta * 0.12)
+    if agent_audit and agent_audit.get("suspected_stage") in {"terminal_matching", "pin_location"}:
+        score += 0.08
+    return round(min(score, 0.95), 3)
+
+
+def _generate_axis_flip_candidates(
+    debug_dir: Path,
+    agent_audit: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    topology = _read_json(debug_dir / "topology.json") or {}
+    evidence_graph = _read_json(debug_dir / "evidence_graph.json") or {}
+    nodes_payload = _read_json(debug_dir / "nodes.json") or {}
+    raw_to_node = _raw_component_to_node_lookup(topology, nodes_payload)
+    components = _component_lookup(topology)
+    pin_groups = _pin_group_lookup(topology)
+    before = _metrics_for_merge(topology)
+    candidates: list[dict[str, Any]] = []
+    candidate_index = 1
+
+    for component_id, current_group in pin_groups.items():
+        component = components.get(component_id)
+        if not component or int(current_group.get("pin_count", 0) or 0) != 2:
+            continue
+        current_axis = str(current_group.get("axis") or "horizontal")
+        if current_axis not in {"horizontal", "vertical"}:
+            continue
+        alternate_axis = "vertical" if current_axis == "horizontal" else "horizontal"
+        alternate_group = _pin_group_for_axis(component, current_group, alternate_axis)
+        if not alternate_group:
+            continue
+        current_score = _score_axis_group(current_group, evidence_graph, raw_to_node)
+        alternate_score = _score_axis_group(alternate_group, evidence_graph, raw_to_node)
+        if not alternate_score["pin_node_overrides"]:
+            continue
+        if (
+            alternate_score["attached_pin_count"] <= current_score["attached_pin_count"]
+            and alternate_score["attached_score_sum"] <= current_score["attached_score_sum"] + 0.25
+            and before["unmatched_pin_count"] == 0
+        ):
+            continue
+
+        after = _metrics_for_merge(topology, pin_node_overrides=alternate_score["pin_node_overrides"])
+        validation = validate_topology_candidate("component_pin_axis_flip", before, after)
+        score = _score_axis_flip_candidate(
+            before,
+            after,
+            current_score,
+            alternate_score,
+            str(current_group.get("axis_source", "")),
+            agent_audit,
+        )
+        risk = _risk_level_for_validation(validation, score)
+        target_pins = [str(pin.get("pin_id")) for pin in current_group.get("pins", []) if pin.get("pin_id")]
+        candidates.append(
+            {
+                "candidate_id": f"AXF{candidate_index}",
+                "repair_type": "component_pin_axis_flip",
+                "summary": (
+                    f"Dry-run flip {component_id} pins from {current_axis} to {alternate_axis}."
+                ),
+                "target_nodes": sorted(set(alternate_score["pin_node_overrides"].values())),
+                "affected_nets": sorted(set(alternate_score["pin_node_overrides"].values())),
+                "target_pins": target_pins,
+                "target_component_id": component_id,
+                "geometry": {
+                    "bbox": component.get("bbox"),
+                    "current_axis": current_axis,
+                    "alternate_axis": alternate_axis,
+                    "replacement_pin_group": alternate_group,
+                    "pin_node_overrides": alternate_score["pin_node_overrides"],
+                },
+                "before_metrics": before,
+                "after_metrics": after,
+                "validation": validation,
+                "improved_metrics": validation["improved_metrics"],
+                "regressed_metrics": validation["regressed_metrics"],
+                "validation_result": validation["validation_result"],
+                "blocking_issues": validation["blocking_issues"],
+                "score": score,
+                "risk_level": risk,
+                "reasons": [
+                    f"Current axis is {current_axis} from {current_group.get('axis_source')}.",
+                    f"Alternate axis is {alternate_axis}.",
+                    f"Current attached pins: {current_score['attached_pin_count']}; alternate attached pins: {alternate_score['attached_pin_count']}.",
+                    f"Current attachment score sum: {current_score['attached_score_sum']}; alternate: {alternate_score['attached_score_sum']}.",
+                    f"Unmatched pin count changes {before['unmatched_pin_count']} -> {after['unmatched_pin_count']}.",
+                ],
+                "evidence": {
+                    "current_axis_score": current_score,
+                    "alternate_axis_score": alternate_score,
+                },
+                "mutates_topology": False,
+            }
+        )
+        candidate_index += 1
+
+    return candidates[:AXIS_FLIP_MAX_CANDIDATES]
+
+
 def _score_evidence_review_candidate(source_candidate: dict[str, Any]) -> float:
     issue_type = str(source_candidate.get("issue_type", ""))
     severity = str(source_candidate.get("severity", "info"))
@@ -650,6 +1102,295 @@ def _generate_evidence_review_candidates(
     return candidates[:EVIDENCE_REVIEW_MAX_CANDIDATES]
 
 
+def _score_gap_bridge_merge_candidate(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    distance: float,
+    support_status: str,
+    agent_audit: dict[str, Any] | None,
+) -> float:
+    score = 0.24
+    if support_status in {"between_best_supported_components", "between_supported_components"}:
+        score += 0.2
+    elif support_status == "between_path_supported_components":
+        score += 0.15
+    elif support_status == "one_sided_supported":
+        score += 0.06
+    if distance <= 12:
+        score += 0.14
+    elif distance <= 32:
+        score += 0.1
+    single_pin_delta = before["single_pin_net_count"] - after["single_pin_net_count"]
+    unmatched_delta = before["unmatched_pin_count"] - after["unmatched_pin_count"]
+    if single_pin_delta > 0:
+        score += min(0.22, single_pin_delta * 0.11)
+    if unmatched_delta > 0:
+        score += min(0.18, unmatched_delta * 0.12)
+    if agent_audit and agent_audit.get("primary_issue") == "split_real_connection_or_missing_bridge":
+        score += 0.08
+    return round(min(score, 0.95), 3)
+
+
+def _generate_gap_bridge_merge_candidates(
+    debug_dir: Path,
+    agent_audit: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    topology = _read_json(debug_dir / "topology.json") or {}
+    source_payload = _read_json(debug_dir / "repair_candidates.json") or {}
+    nodes_payload = _read_json(debug_dir / "nodes.json") or {}
+    raw_to_node = _raw_component_to_node_lookup(topology, nodes_payload)
+    before = _metrics_for_merge(topology)
+    candidates: list[dict[str, Any]] = []
+    candidate_index = 1
+    seen_node_pairs: set[tuple[str, str]] = set()
+
+    for source_candidate in source_payload.get("candidates", []) or []:
+        if str(source_candidate.get("issue_type", "")) != "possible_gap_bridge":
+            continue
+        refs = source_candidate.get("refs", {})
+        evidence = source_candidate.get("evidence", {})
+        source_raw_ids = [
+            refs.get("from_component_id"),
+            refs.get("to_component_id"),
+        ]
+        target_nodes = sorted(
+            {
+                raw_to_node[str(raw_component_id)]
+                for raw_component_id in source_raw_ids
+                if raw_component_id and str(raw_component_id) in raw_to_node
+            }
+        )
+        if len(target_nodes) != 2:
+            continue
+        node_pair = tuple(target_nodes)
+        if node_pair in seen_node_pairs:
+            continue
+        seen_node_pairs.add(node_pair)
+
+        after = _metrics_for_merge(topology, target_nodes)
+        validation = validate_topology_candidate("gap_bridge_merge", before, after)
+        distance = float(evidence.get("distance", 999999.0) or 999999.0)
+        support_status = str(evidence.get("support_status", ""))
+        score = _score_gap_bridge_merge_candidate(before, after, distance, support_status, agent_audit)
+        risk = _risk_level_for_validation(validation, score)
+        source_id = source_candidate.get("repair_candidate_id")
+        reasons = [
+            f"Imported from possible_gap_bridge {source_id}.",
+            f"Bridge maps raw components {source_raw_ids} to nodes {target_nodes}.",
+            f"Bridge support status is {support_status or 'unknown'}.",
+            f"Bridge distance is {round(distance, 3)} px.",
+        ]
+        candidates.append(
+            {
+                "candidate_id": f"GBR{candidate_index}",
+                "repair_type": "gap_bridge_merge",
+                "summary": f"Dry-run bridge merge {target_nodes[0]} + {target_nodes[1]}.",
+                "target_nodes": target_nodes,
+                "affected_nets": target_nodes,
+                "target_pins": evidence.get("support_pin_ids", []),
+                "geometry": {
+                    "bridge_candidate_id": refs.get("bridge_candidate_id"),
+                    "from_component_id": refs.get("from_component_id"),
+                    "to_component_id": refs.get("to_component_id"),
+                    "points": evidence.get("points"),
+                    "point": evidence.get("point"),
+                    "projected_point": evidence.get("projected_point"),
+                    "distance": evidence.get("distance"),
+                },
+                "before_metrics": before,
+                "after_metrics": after,
+                "validation": validation,
+                "improved_metrics": validation["improved_metrics"],
+                "regressed_metrics": validation["regressed_metrics"],
+                "validation_result": validation["validation_result"],
+                "blocking_issues": validation["blocking_issues"],
+                "score": score,
+                "risk_level": risk,
+                "reasons": reasons,
+                "evidence": {
+                    "source_repair_candidate": source_candidate,
+                },
+                "mutates_topology": False,
+            }
+        )
+        candidate_index += 1
+
+    return candidates[:GAP_BRIDGE_MERGE_MAX_CANDIDATES]
+
+
+def _attachment_lookup(terminal_attachments: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(attachment.get("pin_id")): attachment
+        for attachment in terminal_attachments.get("attachments", []) or []
+        if attachment.get("pin_id")
+    }
+
+
+def _node_pin_ids(node: dict[str, Any]) -> list[str]:
+    return [str(item) for item in node.get("pin_ids", []) or [] if item]
+
+
+def _node_pin_count(node: dict[str, Any]) -> int:
+    return len(set(_node_pin_ids(node)))
+
+
+def _score_single_pin_stub_bridge_candidate(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    gap: dict[str, float | bool],
+    attachment_score: float,
+    target_pin_count: int,
+    agent_audit: dict[str, Any] | None,
+) -> float:
+    score = 0.18
+    if attachment_score >= 0.9:
+        score += 0.22
+    elif attachment_score >= 0.75:
+        score += 0.16
+    elif attachment_score >= STUB_BRIDGE_MIN_ATTACHMENT_SCORE:
+        score += 0.1
+    distance = float(gap.get("distance", 999999.0) or 999999.0)
+    if distance <= 16:
+        score += 0.18
+    elif distance <= 40:
+        score += 0.12
+    elif distance <= SINGLE_PIN_STUB_BRIDGE_MAX_BBOX_GAP:
+        score += 0.06
+    if gap.get("axis_aligned"):
+        score += 0.12
+    if target_pin_count >= 2:
+        score += 0.12
+    single_pin_delta = before["single_pin_net_count"] - after["single_pin_net_count"]
+    if single_pin_delta > 0:
+        score += min(0.24, single_pin_delta * 0.12)
+    if agent_audit and agent_audit.get("primary_issue") == "split_real_connection_or_missing_bridge":
+        score += 0.08
+    return round(min(score, 0.95), 3)
+
+
+def _generate_single_pin_stub_bridge_candidates(
+    debug_dir: Path,
+    agent_audit: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    topology = _read_json(debug_dir / "topology.json") or {}
+    nodes_payload = _read_json(debug_dir / "nodes.json") or {}
+    terminal_attachments = _read_json(debug_dir / "terminal_attachments.json") or {}
+    nodes = _node_lookup(nodes_payload, topology)
+    attachments_by_pin = _attachment_lookup(terminal_attachments)
+    audit_single_pin_nodes = set(_single_pin_node_ids(agent_audit, topology))
+    before = _metrics_for_merge(topology)
+    candidates: list[dict[str, Any]] = []
+    candidate_index = 1
+    seen_pairs: set[tuple[str, str]] = set()
+
+    single_pin_nodes = [
+        (node_id, node)
+        for node_id, node in nodes.items()
+        if _node_pin_count(node) == 1 and (not audit_single_pin_nodes or node_id in audit_single_pin_nodes)
+    ]
+    if not single_pin_nodes and audit_single_pin_nodes:
+        single_pin_nodes = [
+            (node_id, node)
+            for node_id, node in nodes.items()
+            if node_id in audit_single_pin_nodes and _node_pin_count(node) == 1
+        ]
+
+    target_nodes = [
+        (node_id, node)
+        for node_id, node in nodes.items()
+        if _node_pin_count(node) >= 2
+    ]
+
+    for source_id, source_node in single_pin_nodes:
+        pin_id = _node_pin_ids(source_node)[0]
+        attachment = attachments_by_pin.get(pin_id, {})
+        attachment_score = float(attachment.get("best_attachment_score", 0.0) or 0.0)
+        if attachment_score < STUB_BRIDGE_MIN_ATTACHMENT_SCORE:
+            continue
+        for target_id, target_node in target_nodes:
+            if target_id == source_id:
+                continue
+            pair = tuple(sorted([source_id, target_id]))
+            if pair in seen_pairs:
+                continue
+            gap = _bbox_gap(source_node.get("bbox"), target_node.get("bbox"))
+            distance = float(gap.get("distance", 999999.0) or 999999.0)
+            if distance > SINGLE_PIN_STUB_BRIDGE_MAX_BBOX_GAP:
+                continue
+            if not gap.get("axis_aligned") and distance > 32:
+                continue
+            seen_pairs.add(pair)
+            target_pin_count = _node_pin_count(target_node)
+            after = _metrics_for_merge(topology, [source_id, target_id])
+            validation = validate_topology_candidate("single_pin_stub_bridge", before, after)
+            score = _score_single_pin_stub_bridge_candidate(
+                before,
+                after,
+                gap,
+                attachment_score,
+                target_pin_count,
+                agent_audit,
+            )
+            risk = _risk_level_for_validation(validation, score)
+            reasons = [
+                f"Source node {source_id} has one pin: {pin_id}.",
+                f"Target node {target_id} has {target_pin_count} pins.",
+                f"BBox gap is {round(distance, 3)} px.",
+                "Source and target bboxes are axis-aligned." if gap.get("axis_aligned") else "Source and target bboxes are not axis-aligned.",
+                f"Terminal attachment score for {pin_id} is {round(attachment_score, 3)}.",
+                f"Single-pin net count changes {before['single_pin_net_count']} -> {after['single_pin_net_count']}.",
+            ]
+            candidates.append(
+                {
+                    "candidate_id": f"STB{candidate_index}",
+                    "repair_type": "single_pin_stub_bridge",
+                    "summary": f"Dry-run bridge single-pin stub {source_id} into {target_id}.",
+                    "target_nodes": [source_id, target_id],
+                    "affected_nets": [source_id, target_id],
+                    "target_pins": [pin_id],
+                    "target_component_id": (source_node.get("component_ids") or [None])[0],
+                    "geometry": {
+                        "bbox_gap": gap,
+                        "source_bbox": source_node.get("bbox"),
+                        "target_bbox": target_node.get("bbox"),
+                        "source_node_id": source_id,
+                        "target_node_id": target_id,
+                    },
+                    "before_metrics": before,
+                    "after_metrics": after,
+                    "validation": validation,
+                    "improved_metrics": validation["improved_metrics"],
+                    "regressed_metrics": validation["regressed_metrics"],
+                    "validation_result": validation["validation_result"],
+                    "blocking_issues": validation["blocking_issues"],
+                    "score": score,
+                    "risk_level": risk,
+                    "reasons": reasons,
+                    "evidence": {
+                        "source_node": {
+                            "node_id": source_id,
+                            "pin_ids": _node_pin_ids(source_node),
+                            "bbox": source_node.get("bbox"),
+                            "segment_ids": source_node.get("segment_ids", []),
+                            "raw_component_ids": source_node.get("raw_component_ids", []),
+                        },
+                        "target_node": {
+                            "node_id": target_id,
+                            "pin_ids": _node_pin_ids(target_node),
+                            "bbox": target_node.get("bbox"),
+                            "segment_ids": target_node.get("segment_ids", []),
+                            "raw_component_ids": target_node.get("raw_component_ids", []),
+                        },
+                        "terminal_attachment": attachment,
+                    },
+                    "mutates_topology": False,
+                }
+            )
+            candidate_index += 1
+
+    return candidates[:SINGLE_PIN_STUB_BRIDGE_MAX_CANDIDATES]
+
+
 def _select_repair_tools(agent_audit: dict[str, Any] | None) -> list[dict[str, str]]:
     if not agent_audit:
         return []
@@ -664,6 +1405,7 @@ def _select_repair_tools(agent_audit: dict[str, Any] | None) -> list[dict[str, s
     actions = agent_audit.get("recommended_actions", [])
     action_types = {str(action.get("action_type")) for action in actions}
     diagnosis_types = {str(item.get("issue_type")) for item in diagnoses}
+    evidence_codes = {str(item.get("code")) for item in agent_audit.get("evidence", [])}
 
     if (
         issue == "split_real_connection_or_missing_bridge"
@@ -683,7 +1425,15 @@ def _select_repair_tools(agent_audit: dict[str, Any] | None) -> list[dict[str, s
         or "weak_confidence_terminal_match" in diagnosis_types
         or "inspect_terminal_attachments" in action_types
         or "spot_check_terminal_attachments" in action_types
+        or semantic.get("floating_pins")
+        or semantic.get("unmatched_pins")
     ):
+        selected.append(
+            _tool(
+                "component_axis_flip_dry_run",
+                "Audit includes terminal evidence issues where a whole component pin axis may be wrong.",
+            )
+        )
         selected.append(
             _tool(
                 "reattach_pin_dry_run",
@@ -699,6 +1449,18 @@ def _select_repair_tools(agent_audit: dict[str, Any] | None) -> list[dict[str, s
             _tool(
                 "evidence_review_dry_run",
                 "Audit asks to inspect unsupported evidence or possible bridge support.",
+            )
+        )
+
+    if (
+        "missing_power_source" in evidence_codes
+        or "confirm_missing_power_source" in action_types
+        or semantic.get("circuit_completeness") == "passive_or_missing_power_source"
+    ):
+        selected.append(
+            _tool(
+                "component_class_override_dry_run",
+                "Audit indicates a passive-or-missing-power-source case; inspect class alternatives before changing topology.",
             )
         )
 
@@ -723,6 +1485,164 @@ def _recommended_next_step(
     if selected_tools:
         return "implement_or_run_selected_dry_run_tools"
     return "no_actionable_candidate"
+
+
+def _candidate_matches_arguments(candidate: dict[str, Any], arguments: dict[str, Any] | None) -> bool:
+    if not arguments:
+        return True
+    component_id = str(arguments.get("component_id") or "").strip()
+    target_class = str(
+        arguments.get("target_class")
+        or arguments.get("alternate_class_name")
+        or arguments.get("class_name")
+        or ""
+    ).strip()
+    target_axis = str(arguments.get("target_axis") or arguments.get("alternate_axis") or "").strip()
+    pin_id = str(arguments.get("pin_id") or "").strip()
+    target_node_id = str(arguments.get("target_node_id") or arguments.get("node_id") or "").strip()
+    raw_node_ids = arguments.get("node_ids", [])
+    if raw_node_ids is None:
+        raw_node_ids = []
+    if not isinstance(raw_node_ids, list):
+        raw_node_ids = [raw_node_ids]
+    node_ids = {str(item) for item in raw_node_ids if item}
+    raw_target_nodes = arguments.get("target_nodes", [])
+    if raw_target_nodes is None:
+        raw_target_nodes = []
+    if not isinstance(raw_target_nodes, list):
+        raw_target_nodes = [raw_target_nodes]
+    if raw_target_nodes and not node_ids:
+        node_ids = {str(item) for item in raw_target_nodes if item}
+
+    geometry = candidate.get("geometry", {})
+    if component_id and str(candidate.get("target_component_id") or geometry.get("component_id")) != component_id:
+        return False
+    if target_class and str(geometry.get("alternate_class_name") or "") != target_class:
+        return False
+    if target_axis and str(geometry.get("alternate_axis") or "") != target_axis:
+        return False
+    if pin_id and pin_id not in {str(item) for item in candidate.get("target_pins", [])}:
+        return False
+    if target_node_id and target_node_id not in {str(item) for item in candidate.get("target_nodes", [])}:
+        return False
+    if node_ids and not node_ids.issubset({str(item) for item in candidate.get("target_nodes", [])}):
+        return False
+    return True
+
+
+def _generate_candidates_for_granular_tool(
+    tool_name: str,
+    debug_dir: Path,
+    agent_audit: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if tool_name == "dry_run_merge_nodes":
+        return _generate_merge_node_candidates(debug_dir, agent_audit)
+    if tool_name == "dry_run_component_class_override":
+        return _generate_component_class_override_candidates(debug_dir, agent_audit)
+    if tool_name == "dry_run_component_axis_flip":
+        return _generate_axis_flip_candidates(debug_dir, agent_audit)
+    if tool_name == "dry_run_reattach_pin":
+        return _generate_reattach_pin_candidates(debug_dir, agent_audit)
+    if tool_name == "dry_run_gap_bridge_merge":
+        return _generate_gap_bridge_merge_candidates(debug_dir, agent_audit)
+    if tool_name == "dry_run_single_pin_stub_bridge":
+        return _generate_single_pin_stub_bridge_candidates(debug_dir, agent_audit)
+    raise ValueError(f"Unsupported granular dry-run tool: {tool_name}")
+
+
+def run_granular_repair_dry_run(
+    debug_dir: str | Path,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    output_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run one repair dry-run tool explicitly selected by the agent planner."""
+    if tool_name not in GRANULAR_DRY_RUN_TOOLS:
+        raise ValueError(f"Unsupported granular dry-run tool: {tool_name}")
+    base_dir = Path(debug_dir)
+    out_dir = Path(output_dir) if output_dir else base_dir
+    source_audit_path = base_dir / "agent_audit_report.json"
+    agent_audit = _read_json(source_audit_path)
+    missing_required = _missing_required_artifacts(base_dir)
+    protected_outputs = [_file_digest(base_dir / file_name) for file_name in PROTECTED_OUTPUT_FILES]
+    repair_candidates: list[dict[str, Any]] = []
+    if not missing_required:
+        repair_candidates = _generate_candidates_for_granular_tool(tool_name, base_dir, agent_audit)
+        repair_candidates = [
+            candidate
+            for candidate in repair_candidates
+            if _candidate_matches_arguments(candidate, arguments)
+        ]
+    repair_candidates = rank_repair_candidates(repair_candidates)[:REPAIR_DRY_RUN_MAX_CANDIDATES]
+    viable_count = sum(1 for candidate in repair_candidates if candidate.get("validation_result") == "viable")
+    blocked_count = sum(1 for candidate in repair_candidates if candidate.get("validation_result") == "blocked")
+    reviewable_count = sum(
+        1 for candidate in repair_candidates if candidate.get("validation_result") == "reviewable"
+    )
+    applyable_count = sum(1 for candidate in repair_candidates if candidate.get("candidate_mode") == "applyable")
+    review_only_count = sum(1 for candidate in repair_candidates if candidate.get("candidate_mode") == "review_only")
+    selected_tool = _tool(tool_name, "Planner explicitly selected this granular dry-run tool.")
+    report = {
+        "schema_version": "3.9-granular-repair-dry-run",
+        "case_id": agent_audit.get("case_id") if agent_audit else base_dir.name,
+        "debug_dir": str(base_dir),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "dry_run_only": True,
+        "topology_mutated": False,
+        "debug_artifacts_ok": not missing_required,
+        "missing_required_artifacts": missing_required,
+        "source_agent_audit_report": {
+            "path": str(source_audit_path),
+            "exists": agent_audit is not None,
+            "overall_status": agent_audit.get("overall_status") if agent_audit else None,
+            "primary_issue": agent_audit.get("primary_issue") if agent_audit else None,
+            "suspected_stage": agent_audit.get("suspected_stage") if agent_audit else None,
+        },
+        "selected_repair_tools": [selected_tool] if not missing_required else [],
+        "tool_name": tool_name,
+        "tool_arguments": arguments or {},
+        "repair_candidates": repair_candidates,
+        "candidate_groups": {
+            "applyable": [
+                candidate for candidate in repair_candidates if candidate.get("candidate_mode") == "applyable"
+            ],
+            "review_only": [
+                candidate for candidate in repair_candidates if candidate.get("candidate_mode") == "review_only"
+            ],
+        },
+        "validation_summary": {
+            "candidate_count": len(repair_candidates),
+            "applyable_candidate_count": applyable_count,
+            "review_only_candidate_count": review_only_count,
+            "viable_candidate_count": viable_count,
+            "reviewable_candidate_count": reviewable_count,
+            "blocked_candidate_count": blocked_count,
+            "validator_version": VALIDATOR_VERSION,
+            "ranker_version": RANKER_VERSION,
+            "topology_mutated": False,
+            "protected_output_count": len(protected_outputs),
+            "notes": [
+                "This granular dry-run was explicitly selected by the planner.",
+                "The tool validates candidate effects without mutating topology.json.",
+            ],
+        },
+        "recommended_next_step": "review_ranked_candidate" if repair_candidates else "no_actionable_candidate",
+        "protected_outputs": protected_outputs,
+    }
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_tool_name = tool_name.replace("/", "_")
+    json_path = out_dir / f"{safe_tool_name}.json"
+    md_path = out_dir / f"{safe_tool_name}.md"
+    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    md_path.write_text(render_repair_dry_run_markdown(report), encoding="utf-8")
+    return {
+        "report": report,
+        "outputs": {
+            "json": str(json_path),
+            "markdown": str(md_path),
+        },
+    }
 
 
 def render_repair_dry_run_markdown(report: dict[str, Any]) -> str:
@@ -769,10 +1689,18 @@ def render_repair_dry_run_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- `{file_name}`")
 
     lines.extend(["", "## Repair Candidates", ""])
+    grouped = report.get("candidate_groups", {})
+    if grouped:
+        lines.append(
+            f"- applyable: `{len(grouped.get('applyable', []))}`; "
+            f"review_only: `{len(grouped.get('review_only', []))}`"
+        )
+        lines.append("")
     if candidates:
         for candidate in candidates:
             lines.append(
                 f"- `{candidate.get('candidate_id')}` / `{candidate.get('repair_type')}` "
+                f"mode=`{candidate.get('candidate_mode')}` "
                 f"rank=`{candidate.get('rank')}` ranking_score=`{candidate.get('ranking_score')}` "
                 f"tool_score=`{candidate.get('score')}` "
                 f"risk=`{candidate.get('risk_level')}` validation=`{candidate.get('validation_result')}`: "
@@ -861,9 +1789,14 @@ def run_agent_repair_dry_run(
     selected_tool_ids = {tool["tool_id"] for tool in selected_tools}
     if not missing_required and "merge_nodes_dry_run" in selected_tool_ids:
         repair_candidates.extend(_generate_merge_node_candidates(base_dir, agent_audit))
+    if not missing_required and "component_axis_flip_dry_run" in selected_tool_ids:
+        repair_candidates.extend(_generate_axis_flip_candidates(base_dir, agent_audit))
+    if not missing_required and "component_class_override_dry_run" in selected_tool_ids:
+        repair_candidates.extend(_generate_component_class_override_candidates(base_dir, agent_audit))
     if not missing_required and "reattach_pin_dry_run" in selected_tool_ids:
         repair_candidates.extend(_generate_reattach_pin_candidates(base_dir, agent_audit))
     if not missing_required and "evidence_review_dry_run" in selected_tool_ids:
+        repair_candidates.extend(_generate_gap_bridge_merge_candidates(base_dir, agent_audit))
         repair_candidates.extend(_generate_evidence_review_candidates(base_dir, agent_audit))
     repair_candidates = rank_repair_candidates(repair_candidates)[:REPAIR_DRY_RUN_MAX_CANDIDATES]
     viable_count = sum(1 for candidate in repair_candidates if candidate.get("validation_result") == "viable")
@@ -871,6 +1804,8 @@ def run_agent_repair_dry_run(
     reviewable_count = sum(
         1 for candidate in repair_candidates if candidate.get("validation_result") == "reviewable"
     )
+    applyable_count = sum(1 for candidate in repair_candidates if candidate.get("candidate_mode") == "applyable")
+    review_only_count = sum(1 for candidate in repair_candidates if candidate.get("candidate_mode") == "review_only")
 
     report = {
         "schema_version": "3.1-step5-repair-dry-run",
@@ -890,8 +1825,18 @@ def run_agent_repair_dry_run(
         },
         "selected_repair_tools": selected_tools,
         "repair_candidates": repair_candidates,
+        "candidate_groups": {
+            "applyable": [
+                candidate for candidate in repair_candidates if candidate.get("candidate_mode") == "applyable"
+            ],
+            "review_only": [
+                candidate for candidate in repair_candidates if candidate.get("candidate_mode") == "review_only"
+            ],
+        },
         "validation_summary": {
             "candidate_count": len(repair_candidates),
+            "applyable_candidate_count": applyable_count,
+            "review_only_candidate_count": review_only_count,
             "viable_candidate_count": viable_count,
             "reviewable_candidate_count": reviewable_count,
             "blocked_candidate_count": blocked_count,
@@ -901,7 +1846,7 @@ def run_agent_repair_dry_run(
             "protected_output_count": len(protected_outputs),
             "notes": [
                 "Repair candidates are dry-run only and do not mutate topology.json.",
-                "Dry-run tools implement merge_nodes_dry_run, reattach_pin_dry_run, evidence_review_dry_run, validation, and ranking.",
+                "Dry-run tools implement merge_nodes_dry_run, component_axis_flip_dry_run, component_class_override_dry_run, reattach_pin_dry_run, evidence_review_dry_run, validation, and ranking.",
             ],
         },
         "recommended_next_step": _recommended_next_step(agent_audit, selected_tools, missing_required),

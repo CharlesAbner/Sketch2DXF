@@ -160,6 +160,16 @@ D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_generalization_probe.py --m
 
 这一步主要用于判断规则是否过拟合、参数是否脆弱、反例是否会骗过 terminal corridor / supported graph / node merge。
 
+## Agent 3.7 / Eval 3.8
+
+Agent advisor/apply/eval now uses no-apply-aware eval semantics:
+
+- Advisor final decisions are normalized into `repair_candidate_ready_for_human_review`, `review_only_issue_for_human_review`, `needs_more_evidence`, `no_candidate_found`, and `no_action`.
+- Apply refuses to mix a target debug run with an advisor report from another case.
+- Only apply-able `merge_nodes` candidates generate corrected topology. Review-only candidates generate review/replay metadata but do not mutate topology.
+- Eval distinguishes expected no-apply cases from real missing apply outputs, so no-action and review-only cases are not scored as lost topology.
+- Eval also checks component identity, so a repair that changes component id/refdes/class is flagged as `component_identity_changed`.
+
 ## Agent 3.7
 
 当前 agent 层以 3.4 LangGraph-native tool state machine 为核心，并已经补上 3.5 human-approved repair apply/replay、3.6 eval harness 和 3.7 failure memory。它不是固定调用 5 个工具，而是每轮由 planner 决定调用 0 到 N 个工具，N 由配置或命令行控制。默认每轮最多 3 个工具，最多 6 轮。

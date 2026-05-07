@@ -71,6 +71,9 @@ def _config_values(config: dict) -> dict:
                 topology_cfg.get("node_bridge_gap", 32),
             )
         ),
+        "component_axis_review_confidence_threshold": float(
+            repair_cfg.get("component_axis_review_confidence_threshold", 0.75)
+        ),
     }
 
 
@@ -283,6 +286,78 @@ def _add_pin_match_candidates(
                     "threshold": config_values["weak_confidence_threshold"],
                 },
             )
+
+
+def _pin_group_by_component(pin_result: dict) -> dict[str, dict]:
+    return {
+        str(group.get("component_id")): group
+        for group in pin_result.get("pins", [])
+        if group.get("component_id")
+    }
+
+
+def _has_power_source_candidate(component: dict) -> bool:
+    power_like = {"power_source", "voltage_source", "voltage.battery", "voltage.dc", "battery"}
+    return any(
+        str(candidate.get("class_name", "")).lower() in power_like
+        for candidate in component.get("class_alternatives", [])
+    )
+
+
+def _add_component_semantic_candidates(
+    candidates: list[dict],
+    pin_result: dict,
+    topology_result: dict,
+    config_values: dict,
+) -> None:
+    pin_groups = _pin_group_by_component(pin_result)
+    axis_threshold = config_values["component_axis_review_confidence_threshold"]
+    for component in topology_result.get("components", []):
+        component_id = component.get("id")
+        alternatives = component.get("class_alternatives", [])
+        if alternatives:
+            severity = "warning" if _has_power_source_candidate(component) else "info"
+            _candidate(
+                candidates,
+                "component_class_ambiguity",
+                severity,
+                "review_component_class_alternative",
+                "This component has overlapping suppressed class alternatives from YOLO/NMS.",
+                {
+                    "component_id": component_id,
+                    "selected_class_name": component.get("class_name"),
+                },
+                {
+                    "class_candidates": component.get("class_candidates", []),
+                    "class_alternatives": alternatives,
+                },
+            )
+
+        pin_group = pin_groups.get(str(component_id))
+        if not pin_group or int(pin_group.get("pin_count", 0)) != 2:
+            continue
+        axis_source = str(pin_group.get("axis_source", ""))
+        confidence = float(pin_group.get("confidence", 0.0) or 0.0)
+        if axis_source == "wire_evidence" or confidence >= axis_threshold:
+            continue
+        _candidate(
+            candidates,
+            "component_terminal_axis_review",
+            "info",
+            "confirm_component_terminal_axis",
+            "The component terminal axis was selected by fallback rather than direct wire evidence.",
+            {
+                "component_id": component_id,
+                "axis": pin_group.get("axis"),
+                "axis_source": axis_source,
+            },
+            {
+                "axis_confidence": confidence,
+                "axis_candidates": pin_group.get("axis_candidates", {}),
+                "pins": pin_group.get("pins", []),
+                "threshold": axis_threshold,
+            },
+        )
 
 
 def _add_ambiguous_attachment_candidates(
@@ -519,6 +594,7 @@ def build_repair_candidates(
         terminal_attachments,
         config_values,
     )
+    _add_component_semantic_candidates(candidates, pin_result, topology_result, config_values)
     _add_ambiguous_attachment_candidates(candidates, terminal_attachments, config_values)
     _add_unsupported_evidence_candidates(candidates, supported_graph, config_values)
     _add_bridge_candidates(candidates, supported_graph)

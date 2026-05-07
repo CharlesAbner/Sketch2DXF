@@ -1,12 +1,4 @@
-"""
-本文件的作用：
-- 根据元件类别、bbox 和附近导线关系，生成 pin 的几何位置。
-- 这是从“检测到元件”走向“恢复连接关系”的关键一步。
-
-说明：
-- 当前版本先保证 pin 朝向和落点相对稳定。
-- 精细 pin 几何仍然可以在后续继续优化。
-"""
+"""Locate coarse terminal positions for detected circuit components."""
 
 from __future__ import annotations
 
@@ -22,11 +14,11 @@ def _segment_endpoints(segment: dict) -> list[tuple[int, int]]:
     ]
 
 
-def _infer_component_axis(component: dict, wire_segments: list[dict], margin: int = 18) -> tuple[str, str, float]:
+def _infer_component_axis(component: dict, wire_segments: list[dict], margin: int = 18) -> tuple[str, str, float, dict]:
     """Infer whether the component pins are arranged horizontally or vertically."""
     bbox = component.get("bbox")
     if not bbox or len(bbox) != 4:
-        return "horizontal", "fallback", 0.5
+        return "horizontal", "fallback", 0.5, {}
     x1, y1, x2, y2 = [int(v) for v in bbox]
     cx = int(round((x1 + x2) / 2))
     cy = int(round((y1 + y2) / 2))
@@ -48,14 +40,21 @@ def _infer_component_axis(component: dict, wire_segments: list[dict], margin: in
 
     horizontal_score = side_scores["left"] + side_scores["right"]
     vertical_score = side_scores["top"] + side_scores["bottom"]
+    axis_candidates = {
+        "wire_side_scores": {key: round(float(value), 3) for key, value in side_scores.items()},
+        "wire_horizontal_score": round(float(horizontal_score), 3),
+        "wire_vertical_score": round(float(vertical_score), 3),
+    }
     if vertical_score > horizontal_score:
         total = vertical_score + horizontal_score
         confidence = 0.5 if total <= 0.0 else vertical_score / total
-        return "vertical", "wire_evidence", round(float(confidence), 3)
+        axis_candidates["selected_by"] = "wire_evidence"
+        return "vertical", "wire_evidence", round(float(confidence), 3), axis_candidates
     total = vertical_score + horizontal_score
     confidence = 0.5 if total <= 0.0 else horizontal_score / total
     source = "wire_evidence" if total > 0.0 else "fallback"
-    return "horizontal", source, round(float(confidence), 3)
+    axis_candidates["selected_by"] = source
+    return "horizontal", source, round(float(confidence), 3), axis_candidates
 
 
 def _pins_from_bbox(
@@ -158,7 +157,11 @@ def locate_component_pins(perception_result: dict, config: dict) -> dict:
             pin_count = 2
             pin_layout = "horizontal_pair"
 
-        axis, axis_source, confidence = _infer_component_axis(component, wire_segments, margin=margin)
+        axis, axis_source, confidence, axis_candidates = _infer_component_axis(
+            component,
+            wire_segments,
+            margin=margin,
+        )
         pins.append(
             {
                 "component_id": component.get("id", "unknown_component"),
@@ -166,6 +169,7 @@ def locate_component_pins(perception_result: dict, config: dict) -> dict:
                 "axis": axis,
                 "axis_source": axis_source,
                 "confidence": confidence,
+                "axis_candidates": axis_candidates,
                 "pins": _pins_from_bbox(component, pin_count, pin_layout, axis, axis_source, confidence),
             }
         )

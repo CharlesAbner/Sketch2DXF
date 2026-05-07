@@ -146,11 +146,13 @@ def _patterns_from_eval(eval_report: dict[str, Any]) -> list[dict[str, Any]]:
 def _suggest_actions_for_code(code: str) -> list[str]:
     action_map = {
         "missing_advisor_report": ["Run agent advisor before eval summary."],
-        "missing_replay_report": ["Run repair apply pending/accept before judging repair effect."],
+        "missing_replay_report": ["Legacy eval finding; rerun eval with the no-apply-aware harness."],
+        "missing_apply_unexpected": ["Run repair apply pending/accept before judging repair effect."],
         "applied_without_accept": ["Block apply artifacts unless approval_decision is accept."],
         "topology_mutated_in_place": ["Check apply stage; original topology must remain unchanged."],
         "corrected_export_failed": ["Inspect DXF exporter errors and corrected topology shape."],
         "component_count_changed": ["Verify repair did not drop or duplicate components."],
+        "component_identity_changed": ["Reject repair artifacts where component ids, refdes, or classes changed."],
         "pin_count_changed": ["Verify repair did not drop or duplicate pins."],
         "zero_pin_regression": ["Review node merge; repair may have created empty nets."],
         "single_pin_regression": ["Review repair candidate ranking and unsupported evidence."],
@@ -158,6 +160,7 @@ def _suggest_actions_for_code(code: str) -> list[str]:
         "two_pin_component_same_net": ["Check for shorted two-pin components after merge."],
         "all_pins_on_one_net": ["Reject repair; this likely shorted the circuit."],
         "dry_run_without_attachment_tool": ["Inspect terminal attachments before repair dry-run."],
+        "unsupported_apply_type": ["Treat this as review-only unless an explicit apply implementation is added."],
     }
     return action_map.get(code, ["Review related artifacts and compare overlay/netlist before approval."])
 

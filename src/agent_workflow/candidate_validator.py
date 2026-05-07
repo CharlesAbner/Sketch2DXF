@@ -8,6 +8,7 @@ from typing import Any
 VALIDATOR_VERSION = "3.1-step3-topology-candidate-validator"
 
 METRIC_DIRECTIONS = {
+    "power_source_count": "higher_is_better",
     "single_pin_net_count": "lower_is_better",
     "zero_pin_net_count": "lower_is_better",
     "unmatched_pin_count": "lower_is_better",
@@ -39,6 +40,8 @@ def _metric_delta(metric: str, before: dict[str, Any], after: dict[str, Any]) ->
         outcome = "unchanged"
     elif direction == "lower_is_better":
         outcome = "improved" if delta < 0 else "regressed"
+    elif direction == "higher_is_better":
+        outcome = "improved" if delta > 0 else "regressed"
     else:
         outcome = "changed"
 
@@ -91,6 +94,7 @@ def validate_topology_candidate(
     """Validate a dry-run candidate using topology-level invariants."""
     metrics_to_compare = [
         "single_pin_net_count",
+        "power_source_count",
         "zero_pin_net_count",
         "unmatched_pin_count",
         "component_self_short_count",

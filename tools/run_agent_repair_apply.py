@@ -30,7 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--candidate-id",
         default=None,
-        help="Candidate id to approve/apply. Defaults to the advisor-selected candidate.",
+        help="Optional single candidate id to approve/apply. Overrides repair_plan.",
+    )
+    parser.add_argument(
+        "--plan-id",
+        default=None,
+        help="Repair plan id to approve/apply. Defaults to advisor repair_plan.",
     )
     parser.add_argument(
         "--approval",
@@ -61,6 +66,7 @@ def main() -> None:
         advisor_report=args.advisor_report,
         output_dir=args.output_dir,
         candidate_id=args.candidate_id,
+        plan_id=args.plan_id,
         approval=args.approval,
         approval_file=args.approval_file,
         approved_by=args.approved_by,
@@ -74,7 +80,11 @@ def main() -> None:
                 "schema_version": report.get("schema_version"),
                 "status": report.get("status"),
                 "decision": report.get("approval_decision", {}).get("decision"),
+                "repair_plan": report.get("repair_plan"),
                 "candidate": report.get("candidate", {}).get("candidate_id"),
+                "applied_candidates": [
+                    item.get("candidate_id") for item in report.get("applied_candidates", [])
+                ],
                 "topology_mutated_in_place": report.get("topology_mutated_in_place"),
                 "before_metrics": report.get("before_metrics"),
                 "after_metrics": report.get("after_metrics"),

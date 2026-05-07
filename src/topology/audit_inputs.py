@@ -70,6 +70,8 @@ def _summarize_components(topology_result: dict, pin_result: dict, proposal_resu
                 "component_id": component["id"],
                 "refdes": component.get("refdes"),
                 "class_name": component.get("class_name"),
+                "class_candidates": component.get("class_candidates", []),
+                "class_alternatives": component.get("class_alternatives", []),
                 "bbox": component.get("bbox"),
                 "score": proposal.get("score", component.get("score")),
                 "source": proposal.get("source", component.get("source")),

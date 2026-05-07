@@ -260,6 +260,25 @@ D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_advisor.py out
 
 Memory 只提供上下文，不提供最终判决。它的典型用途是提醒 planner：类似图过去常见问题是单 pin net、错误 merge、DXF 导出失败、短路风险，所以下一轮应优先调用哪些检查工具。
 
+## Agent Eval 3.8 Safety Updates
+
+The eval/apply layer now has stricter consistency semantics:
+
+- `run_agent_repair_apply.py` verifies that the target debug run, `case_summary.json`, and `agent_repair_advisor_report.json` all describe the same case before writing approval or corrected artifacts.
+- Review-only candidates such as `evidence_review` are not auto-applied. If accepted through the apply CLI, they produce `repair_replay_report.json` with `status=unsupported_apply_type` instead of crashing or writing corrected topology.
+- Eval no longer treats a missing replay report as a failed repair by default. It distinguishes `no_action_expected`, `review_only_expected`, `pending_human_approval`, `approval_not_accepted`, `unsupported_apply_type`, and `missing_apply_unexpected`.
+- Missing corrected netlist/DXF is only a failure when a replay was actually expected. For no-action or review-only cases, the baseline topology is explicitly marked as retained.
+- Eval checks component identity, not just component count. A repaired netlist that changes component id/refdes/class now raises `component_identity_changed`.
+- Multi-case summary prefers existing per-case eval reports only when they use the current eval schema and the same `strategy_name`; otherwise it regenerates that case eval.
+
+Reviewer decisions use these normalized labels:
+
+- `repair_candidate_ready_for_human_review`: an apply-able repair candidate, currently `merge_nodes`, is ready for human confirmation.
+- `review_only_issue_for_human_review`: evidence or low-confidence issues should be inspected, but no automatic topology correction is selected.
+- `needs_more_evidence`: tool results are insufficient or inconclusive.
+- `no_candidate_found`: repair dry-run ran but produced no actionable candidate.
+- `no_action`: no further action is recommended.
+
 ## What Agent Adds
 
 当前 agent 真正负责：

@@ -29,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional summary JSON path. Defaults to outputs/reports/<image_stem>_pipeline_summary.json.",
     )
+    parser.add_argument(
+        "--dxf-mode",
+        choices=("clean", "debug"),
+        default=None,
+        help="DXF export style. clean hides internal pin/node labels; debug keeps them.",
+    )
     return parser
 
 
@@ -38,6 +44,9 @@ def main() -> None:
     config = get_default_config()
     if args.proposal_backend:
         config["detector"]["proposal_backend"] = args.proposal_backend
+    if args.dxf_mode:
+        config.setdefault("export", {})
+        config["export"]["dxf_mode"] = args.dxf_mode
 
     state = run_pipeline(str(image_path), config)
     output_path = (

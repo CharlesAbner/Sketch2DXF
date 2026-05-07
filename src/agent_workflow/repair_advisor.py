@@ -1,4 +1,4 @@
-"""LangGraph-native tool state machine advisor for Sketch2DXF agent 3.4."""
+"""Hypothesis-driven LangGraph tool advisor for Sketch2DXF agent 3.9."""
 
 from __future__ import annotations
 
@@ -12,11 +12,11 @@ from pydantic import BaseModel
 from src.config import get_default_config
 from src.agent_workflow.failure_memory import query_failure_memory
 from src.agent_workflow.llm_client import complete_json
-from src.agent_workflow.repair_dry_run import run_agent_repair_dry_run
+from src.agent_workflow.repair_dry_run import run_agent_repair_dry_run, run_granular_repair_dry_run
 from src.agent_workflow.workflow import run_agent_audit_workflow
 
 
-SCHEMA_VERSION = "3.4-langgraph-native-tool-state-machine"
+SCHEMA_VERSION = "3.9-hypothesis-tool-agent"
 ADVISOR_OUTPUT_JSON = "agent_repair_advisor_report.json"
 ADVISOR_OUTPUT_MD = "agent_repair_advisor_report.md"
 DOSSIER_OUTPUT_JSON = "agent_human_review_dossier.json"
@@ -31,6 +31,59 @@ ALLOWED_TOOL_NAMES = {
     "get_terminal_attachments",
     "get_repair_candidates",
     "repair_dry_run",
+    "inspect_single_pin_nets",
+    "inspect_terminal_attachments",
+    "inspect_component_class_candidates",
+    "inspect_component_terminal_axis",
+    "inspect_gap_bridge_candidates",
+    "inspect_single_pin_stub",
+    "dry_run_merge_nodes",
+    "dry_run_component_class_override",
+    "dry_run_component_axis_flip",
+    "dry_run_reattach_pin",
+    "dry_run_gap_bridge_merge",
+    "dry_run_single_pin_stub_bridge",
+    "validate_candidate",
+}
+
+READ_ONLY_TOOL_NAMES = {
+    "get_case_summary",
+    "get_single_pin_nets",
+    "get_terminal_attachments",
+    "get_repair_candidates",
+    "inspect_single_pin_nets",
+    "inspect_terminal_attachments",
+    "inspect_component_class_candidates",
+    "inspect_component_terminal_axis",
+    "inspect_gap_bridge_candidates",
+    "inspect_single_pin_stub",
+}
+
+GRANULAR_DRY_RUN_TOOL_NAMES = {
+    "dry_run_merge_nodes",
+    "dry_run_component_class_override",
+    "dry_run_component_axis_flip",
+    "dry_run_reattach_pin",
+    "dry_run_gap_bridge_merge",
+    "dry_run_single_pin_stub_bridge",
+}
+
+APPLYABLE_REPAIR_TYPES = {
+    "merge_nodes",
+    "reattach_pin",
+    "gap_bridge_merge",
+    "single_pin_stub_bridge",
+    "component_pin_axis_flip",
+    "component_class_override",
+}
+
+GRANULAR_TOOL_TO_REPAIR_TYPE = {
+    "dry_run_merge_nodes": "merge_nodes",
+    "dry_run_component_class_override": "component_class_override",
+    "dry_run_component_axis_flip": "component_pin_axis_flip",
+    "dry_run_reattach_pin": "reattach_pin",
+    "dry_run_gap_bridge_merge": "gap_bridge_merge",
+    "dry_run_single_pin_stub_bridge": "single_pin_stub_bridge",
 }
 
 ARTIFACT_FILES = {
@@ -47,9 +100,8 @@ ARTIFACT_FILES = {
 
 
 PLANNER_SYSTEM_PROMPT = """You are the planner in a Sketch2DXF repair advisor.
-You receive deterministic audit facts, a compact observation of local artifacts,
-and any tool results gathered so far. Choose the next safe tool call(s). Return
-JSON only.
+You receive neutral deterministic facts, weak anomaly signals, and any tool
+results gathered so far. Choose the next safe tool call(s). Return JSON only.
 
 The observation may include failure_memory: recurring failure patterns learned
 from prior eval reports. Treat memory as context for what to inspect next, not
@@ -59,28 +111,55 @@ Available tool meanings:
 - get_case_summary: read compact case-level quality/risk facts. The compact
   case summary is already present in observation, so call this only if the
   observation is missing or you need the raw compact artifact again.
-- get_single_pin_nets: inspect nets with fewer than two pins and related pins.
-- get_terminal_attachments: inspect terminal-to-evidence attachment candidates.
-- get_repair_candidates: read deterministic repair/review candidates.
-- repair_dry_run: generate validated/ranked dry-run repair candidates. It does
-  not modify topology, netlist, or DXF.
+- inspect_single_pin_nets: inspect nets with fewer than two pins and related pins.
+- inspect_terminal_attachments: inspect terminal-to-evidence attachment candidates.
+- inspect_component_class_candidates: inspect class alternatives for components.
+- inspect_component_terminal_axis: inspect a component's current pin axis and
+  attachment evidence.
+- inspect_gap_bridge_candidates: inspect candidate evidence gaps between graph nodes.
+- inspect_single_pin_stub: inspect single-pin terminal stubs and nearby
+  supported nodes.
+- dry_run_component_class_override: validate one class-change hypothesis.
+- dry_run_component_axis_flip: validate one component-axis hypothesis.
+- dry_run_reattach_pin: validate one pin reattachment hypothesis.
+- dry_run_gap_bridge_merge: validate one gap-bridge merge hypothesis.
+- dry_run_single_pin_stub_bridge: validate one single-pin stub bridge hypothesis.
+- dry_run_merge_nodes: validate one node-merge hypothesis.
+- validate_candidate: re-read validation/ranking details for a previously
+  returned candidate.
+- repair_dry_run: legacy bulk dry-run fallback. Prefer granular dry-run tools
+  unless no granular tool covers the hypothesis.
+
+Tool family guidance is included in tool_families. Use it to map the kind of
+question you are asking to the right inspection/dry-run tools; do not treat it
+as proof that a repair is correct.
 
 Strict rules:
 - You may only call tools listed in available_tools.
-- You may choose no repair tool if the audit has no actionable issue.
+- Use facts and weak_signals as clues, not as final diagnoses.
+- Form at least one explicit hypothesis before calling a dry-run tool.
 - Do not recommend direct topology mutation.
 - Prefer one focused next tool call. The workflow can call you again after the
   result comes back.
-- Gather evidence before dry-run repair.
+- Gather evidence before dry-run repair unless prior tool results already
+  contain the exact target id and target value.
 - Do not repeat tools listed in completed_tool_names.
 - Tool arguments must be JSON objects.
+- Every dry-run tool call must include a hypothesis_id in arguments.
+- If open_questions remain and you do not call another tool, move each one to
+  deferred_questions with a concrete artifact-based reason. Otherwise keep
+  stop_decision=continue and call the next relevant inspection/dry-run tool.
+- Defer a question only when no available tool family can reduce that
+  uncertainty further.
 
 Required JSON keys:
 - tool_calls: list of {"tool_name": str, "reason": str, "arguments": object}
 - planner_notes: list[str]
 - stop_decision: one of continue, final_ready
-- hypotheses: list[str]
+- hypotheses: list of {"id": str, "claim": str, "supporting_facts": list[str],
+  "uncertainty": str}
 - open_questions: list[str]
+- deferred_questions: list of {"question": str, "reason": str}
 """
 
 
@@ -94,15 +173,23 @@ Strict rules:
 - Do not recommend directly mutating topology.
 - If a candidate is useful, recommend human review/confirmation only.
 - confirmed_by_artifacts must contain only facts present in the payload.
+- Prefer candidates that are supported by an explicit hypothesis and a matching
+  dry-run result.
 
 Required JSON keys:
-- final_decision: one of candidate_ready_for_human_review, needs_more_evidence,
-  no_candidate_found, no_action
-- selected_candidate_ids: list[str]
+- final_decision: one of repair_candidate_ready_for_human_review,
+  review_only_issue_for_human_review, needs_more_evidence, no_candidate_found,
+  no_action
+- repair_plan: object with {"plan_id": str, "status": str, "steps": list}.
+  Each step should include step_id, candidate_id, repair_type, hypothesis_id,
+  candidate_mode, expected_improvement, and depends_on.
+- selected_hypothesis_ids: list[str]
 - rationale: str
 - confirmed_by_artifacts: list[str]
 - risks: list[str]
 - next_actions: list[str]
+- hypothesis_assessment: list of {"hypothesis_id": str, "status": str,
+  "reason": str}
 """
 
 
@@ -157,6 +244,57 @@ def _as_id_list(value: Any) -> list[str]:
             seen.add(text)
             result.append(text)
     return result
+
+
+def _argument_ids(arguments: dict[str, Any], plural_key: str, singular_key: str) -> list[str]:
+    return _as_id_list(arguments.get(plural_key) or arguments.get(singular_key))
+
+
+def _as_dict_list(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    result = []
+    for item in value:
+        if isinstance(item, dict):
+            result.append(item)
+        else:
+            result.append({"text": str(item)})
+    return result
+
+
+def _component_pin_groups(topology: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(topology, dict):
+        return {}
+    return {
+        str(group.get("component_id")): group
+        for group in topology.get("pins", [])
+        if group.get("component_id")
+    }
+
+
+def _component_net_refs(netlist: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(netlist, dict):
+        return {}
+    return {
+        str(component.get("component_id")): component
+        for component in netlist.get("components", [])
+        if component.get("component_id")
+    }
+
+
+def _class_name(value: Any) -> str:
+    return str(value or "").lower()
+
+
+def _is_power_class_name(class_name: str) -> bool:
+    text = _class_name(class_name)
+    return (
+        text in {"power_source", "voltage_source", "voltage.ac", "voltage.dc", "voltage.battery", "battery", "source"}
+        or "voltage" in text
+        or "battery" in text
+    )
 
 
 def _artifact_path(debug_dir: Path, artifact_name: str) -> Path:
@@ -216,9 +354,15 @@ def _compact_case_summary(case_summary: dict[str, Any] | None) -> dict[str, Any]
 
 
 def _candidate_snapshot(candidate: dict[str, Any]) -> dict[str, Any]:
+    repair_type = candidate.get("repair_type") or candidate.get("issue_type")
+    candidate_mode = candidate.get("candidate_mode") or (
+        "applyable" if repair_type in APPLYABLE_REPAIR_TYPES else "review_only"
+    )
     return {
         "candidate_id": candidate.get("candidate_id") or candidate.get("repair_candidate_id"),
-        "repair_type": candidate.get("repair_type") or candidate.get("issue_type"),
+        "repair_type": repair_type,
+        "candidate_mode": candidate_mode,
+        "hypothesis_id": candidate.get("hypothesis_id") or candidate.get("geometry", {}).get("hypothesis_id"),
         "summary": candidate.get("summary") or candidate.get("rationale"),
         "rank": candidate.get("rank"),
         "score": candidate.get("score"),
@@ -229,7 +373,10 @@ def _candidate_snapshot(candidate: dict[str, Any]) -> dict[str, Any]:
         "status": candidate.get("status"),
         "target_nodes": candidate.get("target_nodes", []),
         "target_pins": candidate.get("target_pins", []),
+        "target_component_id": candidate.get("target_component_id"),
+        "geometry": candidate.get("geometry", {}),
         "refs": candidate.get("refs", {}),
+        "evidence": candidate.get("evidence", {}),
         "improved_metrics": candidate.get("improved_metrics", []),
         "regressed_metrics": candidate.get("regressed_metrics", []),
         "blocking_issues": candidate.get("blocking_issues", []),
@@ -284,6 +431,20 @@ def _compact_repair_report(
                 repair_type,
             )
         ]
+    fallback_to_unfiltered = bool(active_filter and not filtered_candidates and candidates)
+    if fallback_to_unfiltered:
+        filtered_candidates = candidates
+    top_candidates = [_candidate_snapshot(candidate) for candidate in filtered_candidates[:8]]
+    applyable_candidates = [
+        _candidate_snapshot(candidate)
+        for candidate in filtered_candidates
+        if candidate.get("candidate_mode") == "applyable"
+    ][:8]
+    review_only_candidates = [
+        _candidate_snapshot(candidate)
+        for candidate in filtered_candidates
+        if candidate.get("candidate_mode") == "review_only"
+    ][:8]
     return {
         "exists": True,
         "schema_version": repair_report.get("schema_version"),
@@ -299,8 +460,13 @@ def _compact_repair_report(
             "repair_type": repair_type,
             "unfiltered_candidate_count": len(candidates),
             "filtered_candidate_count": len(filtered_candidates),
+            "fallback_to_unfiltered": fallback_to_unfiltered,
         },
-        "top_candidates": [_candidate_snapshot(candidate) for candidate in filtered_candidates[:8]],
+        "top_candidates": top_candidates,
+        "candidate_groups": {
+            "applyable": applyable_candidates,
+            "review_only": review_only_candidates,
+        },
         "protected_outputs": repair_report.get("protected_outputs", []),
     }
 
@@ -482,6 +648,390 @@ def _compact_terminal_attachments(
     }
 
 
+def _inspect_component_class_candidates(debug_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    topology = _read_json(_artifact_path(debug_dir, "topology"))
+    if not isinstance(topology, dict):
+        return {"exists": False, "components": []}
+    requested_ids = set(_argument_ids(arguments, "component_ids", "component_id"))
+    components = []
+    for component in topology.get("components", []):
+        component_id = str(component.get("id"))
+        if requested_ids and component_id not in requested_ids:
+            continue
+        alternatives = component.get("class_alternatives", []) or []
+        if not requested_ids and not alternatives:
+            continue
+        components.append(
+            {
+                "component_id": component_id,
+                "refdes": component.get("refdes"),
+                "current_class_name": component.get("class_name"),
+                "score": component.get("score"),
+                "bbox": component.get("bbox"),
+                "class_candidates": component.get("class_candidates", []),
+                "class_alternatives": alternatives,
+            }
+        )
+    return {
+        "exists": True,
+        "requested_component_ids": sorted(requested_ids),
+        "component_count": len(components),
+        "components": components[:12],
+    }
+
+
+def _inspect_component_terminal_axis(debug_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    topology = _read_json(_artifact_path(debug_dir, "topology"))
+    attachments = _read_json(_artifact_path(debug_dir, "terminal_attachments"))
+    if not isinstance(topology, dict):
+        return {"exists": False, "components": []}
+    requested_ids = set(_argument_ids(arguments, "component_ids", "component_id"))
+    pin_groups = _component_pin_groups(topology)
+    attachment_by_pin = {}
+    if isinstance(attachments, dict):
+        for attachment in attachments.get("attachments", []):
+            if attachment.get("pin_id"):
+                attachment_by_pin[str(attachment.get("pin_id"))] = _attachment_snapshot(attachment)
+    components = []
+    for component in topology.get("components", []):
+        component_id = str(component.get("id"))
+        if requested_ids and component_id not in requested_ids:
+            continue
+        pin_group = pin_groups.get(component_id, {})
+        if not requested_ids and pin_group.get("axis_source") != "fallback":
+            continue
+        pin_ids = [str(pin.get("pin_id")) for pin in pin_group.get("pins", []) if pin.get("pin_id")]
+        axis = str(pin_group.get("axis") or "")
+        alternate_axis = "vertical" if axis == "horizontal" else "horizontal" if axis == "vertical" else None
+        components.append(
+            {
+                "component_id": component_id,
+                "refdes": component.get("refdes"),
+                "class_name": component.get("class_name"),
+                "bbox": component.get("bbox"),
+                "pin_count": pin_group.get("pin_count"),
+                "current_axis": axis,
+                "axis_source": pin_group.get("axis_source"),
+                "axis_confidence": pin_group.get("confidence"),
+                "alternate_axis": alternate_axis,
+                "axis_candidates": pin_group.get("axis_candidates", {}),
+                "pins": pin_group.get("pins", []),
+                "attachments": [
+                    attachment_by_pin[pin_id]
+                    for pin_id in pin_ids
+                    if pin_id in attachment_by_pin
+                ],
+            }
+        )
+    return {
+        "exists": True,
+        "requested_component_ids": sorted(requested_ids),
+        "component_count": len(components),
+        "components": components[:12],
+    }
+
+
+def _inspect_gap_bridge_candidates(debug_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    doc = _read_json(_artifact_path(debug_dir, "repair_candidates"))
+    if not isinstance(doc, dict):
+        return {"exists": False, "bridge_candidate_count": 0, "candidates": []}
+    requested_nodes = set(_as_id_list(arguments.get("node_ids") or arguments.get("node_id") or arguments.get("target_nodes")))
+    candidates = []
+    for candidate in doc.get("candidates", []):
+        issue_type = str(candidate.get("issue_type") or "")
+        if issue_type not in {"possible_gap_bridge", "unsupported_evidence_review"}:
+            continue
+        refs = candidate.get("refs", {})
+        evidence = candidate.get("evidence", {})
+        node_refs = {
+            str(item)
+            for item in [
+                refs.get("node_id"),
+                refs.get("from_node_id"),
+                refs.get("to_node_id"),
+            ]
+            if item
+        }
+        if requested_nodes and node_refs and not requested_nodes.intersection(node_refs):
+            continue
+        candidates.append(
+            {
+                "repair_candidate_id": candidate.get("repair_candidate_id"),
+                "issue_type": issue_type,
+                "severity": candidate.get("severity"),
+                "recommended_action": candidate.get("recommended_action"),
+                "rationale": candidate.get("rationale"),
+                "refs": refs,
+                "evidence": evidence,
+            }
+        )
+    return {
+        "exists": True,
+        "requested_node_ids": sorted(requested_nodes),
+        "bridge_candidate_count": len(candidates),
+        "candidates": candidates[:12],
+    }
+
+
+def _bbox_gap_summary(left: list[Any] | None, right: list[Any] | None) -> dict[str, Any]:
+    if not left or not right or len(left) < 4 or len(right) < 4:
+        return {"distance": None, "axis_aligned": False}
+    l1, t1, r1, b1 = [float(value) for value in left[:4]]
+    l2, t2, r2, b2 = [float(value) for value in right[:4]]
+    dx = max(l1 - r2, l2 - r1, 0.0)
+    dy = max(t1 - b2, t2 - b1, 0.0)
+    return {
+        "distance": round((dx * dx + dy * dy) ** 0.5, 3),
+        "dx": round(dx, 3),
+        "dy": round(dy, 3),
+        "axis_aligned": dx == 0.0 or dy == 0.0,
+    }
+
+
+def _inspect_single_pin_stub(debug_dir: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    topology = _read_json(_artifact_path(debug_dir, "topology"))
+    nodes_payload = _read_json(_artifact_path(debug_dir, "active_nodes"))
+    attachments_payload = _read_json(_artifact_path(debug_dir, "terminal_attachments"))
+    if not isinstance(topology, dict):
+        return {"exists": False, "stub_count": 0, "stubs": []}
+    nodes = {
+        str(node.get("node_id")): node
+        for node in (nodes_payload or {}).get("nodes", topology.get("nodes", []))
+        if node.get("node_id")
+    }
+    attachments_by_pin = {}
+    if isinstance(attachments_payload, dict):
+        attachments_by_pin = {
+            str(attachment.get("pin_id")): _attachment_snapshot(attachment)
+            for attachment in attachments_payload.get("attachments", [])
+            if attachment.get("pin_id")
+        }
+    requested_node_ids = set(_as_id_list(arguments.get("net_ids") or arguments.get("node_ids") or arguments.get("node_id")))
+    requested_pin_ids = set(_argument_ids(arguments, "pin_ids", "pin_id"))
+    stubs = []
+    target_nodes = [
+        node
+        for node in nodes.values()
+        if len(set(_as_id_list(node.get("pin_ids")))) >= 2
+    ]
+    for node_id, node in nodes.items():
+        pin_ids = _as_id_list(node.get("pin_ids"))
+        if len(set(pin_ids)) != 1:
+            continue
+        if requested_node_ids and node_id not in requested_node_ids:
+            continue
+        if requested_pin_ids and not requested_pin_ids.intersection(pin_ids):
+            continue
+        pin_id = pin_ids[0]
+        nearby = []
+        for target in target_nodes:
+            target_id = str(target.get("node_id"))
+            if target_id == node_id:
+                continue
+            gap = _bbox_gap_summary(node.get("bbox"), target.get("bbox"))
+            distance = gap.get("distance")
+            if distance is None or float(distance) > 120:
+                continue
+            nearby.append(
+                {
+                    "node_id": target_id,
+                    "pin_count": len(set(_as_id_list(target.get("pin_ids")))),
+                    "pin_ids": target.get("pin_ids", []),
+                    "bbox": target.get("bbox"),
+                    "bbox_gap": gap,
+                    "raw_component_ids": target.get("raw_component_ids", []),
+                    "segment_ids": target.get("segment_ids", []),
+                }
+            )
+        nearby.sort(key=lambda item: float(item.get("bbox_gap", {}).get("distance") or 999999.0))
+        stubs.append(
+            {
+                "node_id": node_id,
+                "pin_id": pin_id,
+                "pin_ids": pin_ids,
+                "component_ids": node.get("component_ids", []),
+                "bbox": node.get("bbox"),
+                "raw_component_ids": node.get("raw_component_ids", []),
+                "segment_ids": node.get("segment_ids", []),
+                "attachment": attachments_by_pin.get(pin_id),
+                "nearby_supported_nodes": nearby[:5],
+            }
+        )
+    return {
+        "exists": True,
+        "requested_node_ids": sorted(requested_node_ids),
+        "requested_pin_ids": sorted(requested_pin_ids),
+        "stub_count": len(stubs),
+        "stubs": stubs[:12],
+    }
+
+
+def _candidate_pool_from_tool_results(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = []
+    for result in tool_results:
+        summary = result.get("result_summary", {})
+        candidates.extend(summary.get("top_candidates", []))
+        candidates.extend(summary.get("candidates", []))
+        groups = summary.get("candidate_groups", {})
+        if isinstance(groups, dict):
+            candidates.extend(groups.get("applyable", []))
+            candidates.extend(groups.get("review_only", []))
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or candidate.get("repair_candidate_id") or "")
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        deduped.append(candidate)
+    return deduped
+
+
+def _hypothesis_ids_from_candidate_ids(
+    tool_results: list[dict[str, Any]],
+    candidate_ids: list[str],
+) -> list[str]:
+    selected_set = set(_as_id_list(candidate_ids))
+    if not selected_set:
+        return []
+    ids = []
+    for candidate in _candidate_pool_from_tool_results(tool_results):
+        candidate_id = str(candidate.get("candidate_id") or candidate.get("repair_candidate_id") or "")
+        if candidate_id not in selected_set:
+            continue
+        hypothesis_id = candidate.get("hypothesis_id") or candidate.get("geometry", {}).get("hypothesis_id")
+        ids.extend(_as_id_list(hypothesis_id))
+    return _as_id_list(ids)
+
+
+def _candidate_lookup_from_tool_results(tool_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(candidate.get("candidate_id") or candidate.get("repair_candidate_id")): candidate
+        for candidate in _candidate_pool_from_tool_results(tool_results)
+        if candidate.get("candidate_id") or candidate.get("repair_candidate_id")
+    }
+
+
+def _repair_plan_candidate_ids(repair_plan: dict[str, Any] | None) -> list[str]:
+    if not isinstance(repair_plan, dict):
+        return []
+    ids = []
+    for step in repair_plan.get("steps", []) or []:
+        if isinstance(step, dict) and step.get("candidate_id"):
+            ids.append(str(step.get("candidate_id")))
+    return _as_id_list(ids)
+
+
+def _candidate_plan_step(
+    candidate: dict[str, Any],
+    index: int,
+    depends_on: list[str] | None = None,
+) -> dict[str, Any]:
+    candidate_id = str(candidate.get("candidate_id") or candidate.get("repair_candidate_id") or "")
+    repair_type = str(candidate.get("repair_type") or candidate.get("issue_type") or "")
+    hypothesis_id = (
+        candidate.get("hypothesis_id")
+        or candidate.get("geometry", {}).get("hypothesis_id")
+        or candidate.get("evidence", {}).get("hypothesis_id")
+    )
+    return {
+        "step_id": f"S{index}",
+        "candidate_id": candidate_id,
+        "repair_type": repair_type,
+        "hypothesis_id": hypothesis_id,
+        "candidate_mode": candidate.get("candidate_mode"),
+        "expected_improvement": candidate.get("improved_metrics", []),
+        "depends_on": depends_on or [],
+        "candidate": candidate,
+    }
+
+
+def _repair_plan_from_candidate_ids(
+    candidate_ids: list[str],
+    candidate_lookup: dict[str, dict[str, Any]],
+    status: str = "pending_human_review",
+) -> dict[str, Any]:
+    steps = []
+    for candidate_id in _as_id_list(candidate_ids):
+        candidate = candidate_lookup.get(candidate_id)
+        if not candidate:
+            continue
+        steps.append(_candidate_plan_step(candidate, len(steps) + 1))
+    return {
+        "plan_id": "PLAN1",
+        "status": status if steps else "no_repair_plan",
+        "steps": steps,
+    }
+
+
+def _normalize_repair_plan(
+    content: dict[str, Any],
+    candidate_lookup: dict[str, dict[str, Any]],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    raw_plan = content.get("repair_plan")
+    if isinstance(raw_plan, dict):
+        raw_steps = raw_plan.get("steps", []) or []
+        steps = []
+        for raw_step in raw_steps:
+            if not isinstance(raw_step, dict):
+                continue
+            candidate_id = str(raw_step.get("candidate_id") or "").strip()
+            candidate = candidate_lookup.get(candidate_id)
+            if not candidate:
+                continue
+            step = _candidate_plan_step(candidate, len(steps) + 1, _as_id_list(raw_step.get("depends_on")))
+            if raw_step.get("step_id"):
+                step["step_id"] = str(raw_step.get("step_id"))
+            if raw_step.get("hypothesis_id") and not step.get("hypothesis_id"):
+                step["hypothesis_id"] = str(raw_step.get("hypothesis_id"))
+            if raw_step.get("expected_improvement"):
+                step["expected_improvement"] = _as_id_list(raw_step.get("expected_improvement"))
+            steps.append(step)
+        if steps:
+            return {
+                "plan_id": str(raw_plan.get("plan_id") or "PLAN1"),
+                "status": str(raw_plan.get("status") or "pending_human_review"),
+                "steps": steps,
+            }
+
+    fallback_plan = fallback.get("repair_plan")
+    if isinstance(fallback_plan, dict):
+        return fallback_plan
+    return {"plan_id": "PLAN1", "status": "no_repair_plan", "steps": []}
+
+
+def _validate_candidate_from_tool_results(
+    tool_results: list[dict[str, Any]],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_id = str(arguments.get("candidate_id") or "").strip()
+    candidates = _candidate_pool_from_tool_results(tool_results)
+    selected = None
+    if candidate_id:
+        for candidate in candidates:
+            if str(candidate.get("candidate_id") or candidate.get("repair_candidate_id")) == candidate_id:
+                selected = candidate
+                break
+    elif candidates:
+        selected = candidates[0]
+    if not selected:
+        return {
+            "exists": False,
+            "candidate_id": candidate_id,
+            "error": "Candidate was not found in prior tool results.",
+        }
+    return {
+        "exists": True,
+        "candidate": selected,
+        "validation": selected.get("validation", {}),
+        "validation_result": selected.get("validation_result"),
+        "ranking": selected.get("ranking", {}),
+        "recommendation": selected.get("recommendation"),
+        "candidate_mode": selected.get("candidate_mode"),
+    }
+
+
 def _available_tools() -> list[dict[str, Any]]:
     return [
         {
@@ -490,26 +1040,318 @@ def _available_tools() -> list[dict[str, Any]]:
             "description": "Read compact case-level quality, risk, and artifact summary.",
         },
         {
-            "tool_name": "get_single_pin_nets",
+            "tool_name": "inspect_single_pin_nets",
             "kind": "read_only",
             "description": "Inspect single-pin nets and map them to pin/component identifiers.",
         },
         {
-            "tool_name": "get_terminal_attachments",
+            "tool_name": "inspect_terminal_attachments",
             "kind": "read_only",
             "description": "Inspect terminal corridor attachment evidence for target pins or nets.",
         },
         {
-            "tool_name": "get_repair_candidates",
+            "tool_name": "inspect_component_class_candidates",
             "kind": "read_only",
-            "description": "Read deterministic review/repair candidates generated by the core pipeline.",
+            "description": "Inspect selected component classes and YOLO class alternatives.",
+        },
+        {
+            "tool_name": "inspect_component_terminal_axis",
+            "kind": "read_only",
+            "description": "Inspect current terminal axis, pin positions, and attachment scores for a component.",
+        },
+        {
+            "tool_name": "inspect_gap_bridge_candidates",
+            "kind": "read_only",
+            "description": "Inspect possible gap bridge candidates without merging nodes.",
+        },
+        {
+            "tool_name": "inspect_single_pin_stub",
+            "kind": "read_only",
+            "description": "Inspect one-pin terminal stubs and nearby supported node evidence.",
+        },
+        {
+            "tool_name": "dry_run_component_class_override",
+            "kind": "dry_run",
+            "description": "Validate one component class override hypothesis without mutating outputs.",
+        },
+        {
+            "tool_name": "dry_run_component_axis_flip",
+            "kind": "dry_run",
+            "description": "Validate one component terminal axis flip hypothesis without mutating outputs.",
+        },
+        {
+            "tool_name": "dry_run_reattach_pin",
+            "kind": "dry_run",
+            "description": "Validate one pin reattachment hypothesis without mutating outputs.",
+        },
+        {
+            "tool_name": "dry_run_gap_bridge_merge",
+            "kind": "dry_run",
+            "description": "Validate one gap-bridge merge hypothesis without mutating outputs.",
+        },
+        {
+            "tool_name": "dry_run_single_pin_stub_bridge",
+            "kind": "dry_run",
+            "description": "Validate one single-pin stub bridge hypothesis without mutating outputs.",
+        },
+        {
+            "tool_name": "dry_run_merge_nodes",
+            "kind": "dry_run",
+            "description": "Validate one node merge hypothesis without mutating outputs.",
+        },
+        {
+            "tool_name": "validate_candidate",
+            "kind": "read_only",
+            "description": "Read validation/ranking details for a previously returned candidate.",
         },
         {
             "tool_name": "repair_dry_run",
-            "kind": "dry_run",
-            "description": "Generate, validate, and rank possible repairs without mutating topology outputs.",
+            "kind": "dry_run_fallback",
+            "description": "Legacy bulk dry-run fallback for batch/eval or uncovered hypotheses.",
         },
     ]
+
+
+def _available_tool_families() -> list[dict[str, Any]]:
+    return [
+        {
+            "family": "terminal_axis_or_pin_orientation",
+            "when_to_consider": [
+                "a component has unmatched pins",
+                "terminal attachment evidence is weak for the current pin axis",
+                "another component axis may explain both pins better",
+            ],
+            "typical_sequence": [
+                "inspect_component_terminal_axis",
+                "dry_run_component_axis_flip",
+            ],
+            "related_tools": [
+                "inspect_terminal_attachments",
+                "dry_run_reattach_pin",
+            ],
+        },
+        {
+            "family": "single_pin_terminal_stub",
+            "when_to_consider": [
+                "a net has exactly one attached pin",
+                "an open question mentions an isolated pin, one-pin stub, or nearby supported node",
+                "a terminal appears to stop near a valid wire node but is not electrically merged",
+            ],
+            "typical_sequence": [
+                "inspect_single_pin_stub",
+                "dry_run_single_pin_stub_bridge",
+            ],
+            "related_tools": [
+                "inspect_single_pin_nets",
+                "inspect_terminal_attachments",
+                "dry_run_merge_nodes",
+            ],
+        },
+        {
+            "family": "component_class_ambiguity",
+            "when_to_consider": [
+                "component class confidence is ambiguous",
+                "the topology has no plausible source while a source-like symbol was detected as a passive component",
+            ],
+            "typical_sequence": [
+                "inspect_component_class_candidates",
+                "dry_run_component_class_override",
+            ],
+            "related_tools": [
+                "get_case_summary",
+            ],
+        },
+        {
+            "family": "gap_between_supported_nodes",
+            "when_to_consider": [
+                "two supported graph nodes are near each other but remain separate",
+                "wire evidence has a short geometric gap",
+            ],
+            "typical_sequence": [
+                "inspect_gap_bridge_candidates",
+                "dry_run_gap_bridge_merge",
+            ],
+            "related_tools": [
+                "dry_run_merge_nodes",
+            ],
+        },
+    ]
+
+
+def _weak_signals_from_artifacts(
+    case_summary: dict[str, Any] | None,
+    audit_report: dict[str, Any] | None,
+    repair_candidates: dict[str, Any] | None,
+    topology: dict[str, Any] | None,
+    netlist: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    seen = set()
+
+    def add(code: str, severity: str = "info", refs: dict[str, Any] | None = None, detail: str | None = None) -> None:
+        key = (code, json.dumps(refs or {}, sort_keys=True, ensure_ascii=False))
+        if key in seen:
+            return
+        seen.add(key)
+        signals.append(
+            {
+                "code": code,
+                "severity": severity,
+                "refs": refs or {},
+                "detail": detail,
+            }
+        )
+
+    components = topology.get("components", []) if isinstance(topology, dict) else []
+    if components and not any(_is_power_class_name(component.get("class_name")) for component in components):
+        add("missing_power_source", "info", detail="No recovered component has a power-source class.")
+    for component in components:
+        alternatives = component.get("class_alternatives", []) or []
+        if alternatives:
+            severity = "warning" if any(_is_power_class_name(item.get("class_name")) for item in alternatives) else "info"
+            add(
+                "component_class_ambiguity",
+                severity,
+                refs={"component_id": component.get("id")},
+                detail="The detector produced overlapping class alternatives for this component.",
+            )
+
+    pins = topology.get("pins", []) if isinstance(topology, dict) else []
+    for group in pins:
+        if group.get("axis_source") == "fallback":
+            add(
+                "component_axis_from_fallback",
+                "info",
+                refs={"component_id": group.get("component_id"), "axis": group.get("axis")},
+                detail="Terminal axis was selected by fallback rather than direct wire evidence.",
+            )
+
+    netlist_nets = netlist.get("nets", []) if isinstance(netlist, dict) else []
+    single_pin_nets = [net.get("net_id") for net in netlist_nets if int(net.get("pin_count", 0) or 0) == 1]
+    if single_pin_nets:
+        add("single_pin_net", "warning", refs={"net_ids": single_pin_nets})
+
+    if isinstance(case_summary, dict):
+        review_focus = case_summary.get("review_focus", {})
+        for risk in review_focus.get("risks", [])[:8]:
+            add(
+                str(risk.get("code") or "case_summary_risk"),
+                str(risk.get("severity") or "info"),
+                risk.get("refs", {}),
+                str(risk.get("message") or ""),
+            )
+
+    if isinstance(repair_candidates, dict):
+        for candidate in repair_candidates.get("candidates", [])[:12]:
+            add(
+                str(candidate.get("issue_type") or "repair_candidate"),
+                str(candidate.get("severity") or "info"),
+                candidate.get("refs", {}),
+                str(candidate.get("rationale") or ""),
+            )
+
+    if isinstance(audit_report, dict):
+        for item in audit_report.get("evidence", [])[:12]:
+            add(
+                str(item.get("code") or "audit_evidence"),
+                str(item.get("severity") or "info"),
+                item.get("refs", {}),
+                str(item.get("message") or ""),
+            )
+    return signals[:20]
+
+
+def _neutral_component_facts(topology: dict[str, Any] | None, netlist: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(topology, dict):
+        return []
+    pin_groups = _component_pin_groups(topology)
+    net_refs = _component_net_refs(netlist)
+    components = []
+    for component in topology.get("components", [])[:16]:
+        component_id = str(component.get("id"))
+        pin_group = pin_groups.get(component_id, {})
+        component_net = net_refs.get(component_id, {})
+        class_candidates = [
+            {
+                "class_name": item.get("class_name"),
+                "score": item.get("score"),
+                "candidate_status": item.get("candidate_status"),
+            }
+            for item in component.get("class_candidates", [])[:5]
+        ]
+        components.append(
+            {
+                "component_id": component_id,
+                "refdes": component.get("refdes"),
+                "class_name": component.get("class_name"),
+                "score": component.get("score"),
+                "bbox": component.get("bbox"),
+                "class_candidates": class_candidates,
+                "class_alternative_count": len(component.get("class_alternatives", []) or []),
+                "pin_count": pin_group.get("pin_count"),
+                "axis": pin_group.get("axis"),
+                "axis_source": pin_group.get("axis_source"),
+                "axis_confidence": pin_group.get("confidence"),
+                "pins": [
+                    {
+                        "pin_id": pin.get("pin_id"),
+                        "side": pin.get("side"),
+                        "x": pin.get("x"),
+                        "y": pin.get("y"),
+                    }
+                    for pin in pin_group.get("pins", [])[:4]
+                ],
+                "net_ids": component_net.get("net_ids", []),
+            }
+        )
+    return components
+
+
+def _neutral_facts(
+    case_summary: dict[str, Any] | None,
+    topology: dict[str, Any] | None,
+    netlist: dict[str, Any] | None,
+    audit_inputs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    summary = case_summary.get("summary", {}) if isinstance(case_summary, dict) else {}
+    components = topology.get("components", []) if isinstance(topology, dict) else []
+    netlist_nets = netlist.get("nets", []) if isinstance(netlist, dict) else []
+    all_pin_ids = []
+    connected_pin_ids = set()
+    if isinstance(topology, dict):
+        for group in topology.get("pins", []):
+            for pin in group.get("pins", []):
+                if pin.get("pin_id"):
+                    all_pin_ids.append(str(pin.get("pin_id")))
+        for connection in topology.get("connections", []):
+            if connection.get("pin_id"):
+                connected_pin_ids.add(str(connection.get("pin_id")))
+    return {
+        "quality": {
+            "review_status": case_summary.get("review_status") if isinstance(case_summary, dict) else None,
+            "quality_label": summary.get("quality_label"),
+            "export_success": summary.get("export_success"),
+            "selected_node_source": summary.get("selected_node_source"),
+            "fallback_used": summary.get("fallback_used"),
+        },
+        "counts": {
+            "component_count": len(components) or summary.get("component_count"),
+            "pin_count": len(all_pin_ids) or summary.get("pin_count"),
+            "connection_count": len(topology.get("connections", [])) if isinstance(topology, dict) else summary.get("connection_count"),
+            "node_count": len(topology.get("nodes", [])) if isinstance(topology, dict) else summary.get("node_count"),
+            "net_count": len(netlist_nets) or summary.get("net_count"),
+            "power_source_count": sum(1 for component in components if _is_power_class_name(component.get("class_name"))),
+            "unmatched_pin_count": len([pin_id for pin_id in all_pin_ids if pin_id not in connected_pin_ids]),
+            "single_pin_net_count": len([net for net in netlist_nets if int(net.get("pin_count", 0) or 0) == 1]),
+        },
+        "components": _neutral_component_facts(topology, netlist),
+        "single_pin_net_ids": [
+            net.get("net_id")
+            for net in netlist_nets
+            if int(net.get("pin_count", 0) or 0) == 1
+        ],
+        "audit_input_summary": audit_inputs.get("summary", {}) if isinstance(audit_inputs, dict) else {},
+    }
 
 
 def _build_observation(
@@ -519,9 +1361,30 @@ def _build_observation(
     memory_limit: int = 5,
 ) -> dict[str, Any]:
     case_summary = _read_json(_artifact_path(debug_dir, "case_summary"))
+    topology = _read_json(_artifact_path(debug_dir, "topology"))
+    netlist = _read_json(_artifact_path(debug_dir, "netlist"))
+    audit_inputs = _read_json(debug_dir / "audit_inputs.json")
+    repair_candidates = _read_json(_artifact_path(debug_dir, "repair_candidates"))
     return {
         "case_summary": _compact_case_summary(case_summary if isinstance(case_summary, dict) else None),
-        "audit": _compact_audit(audit_report),
+        "facts": _neutral_facts(
+            case_summary if isinstance(case_summary, dict) else None,
+            topology if isinstance(topology, dict) else None,
+            netlist if isinstance(netlist, dict) else None,
+            audit_inputs if isinstance(audit_inputs, dict) else None,
+        ),
+        "weak_signals": _weak_signals_from_artifacts(
+            case_summary if isinstance(case_summary, dict) else None,
+            audit_report,
+            repair_candidates if isinstance(repair_candidates, dict) else None,
+            topology if isinstance(topology, dict) else None,
+            netlist if isinstance(netlist, dict) else None,
+        ),
+        "audit_context": {
+            "exists": isinstance(audit_report, dict),
+            "overall_status": audit_report.get("overall_status") if isinstance(audit_report, dict) else None,
+            "confidence": audit_report.get("confidence") if isinstance(audit_report, dict) else None,
+        },
         "artifact_presence": _artifact_presence(debug_dir),
         "available_tools": _available_tools(),
         "failure_memory": query_failure_memory(
@@ -570,6 +1433,24 @@ def _audit_has_terminal_attachment_issue(audit_report: dict[str, Any] | None) ->
     return False
 
 
+def _audit_has_class_or_power_issue(audit_report: dict[str, Any] | None) -> bool:
+    if not audit_report:
+        return False
+    semantic = audit_report.get("topology_semantic_audit", {})
+    if semantic.get("circuit_completeness") == "passive_or_missing_power_source":
+        return True
+    for item in audit_report.get("evidence", []):
+        if item.get("code") in {"missing_power_source", "component_class_ambiguity"}:
+            return True
+    for action in audit_report.get("recommended_actions", []):
+        if action.get("action_type") in {
+            "confirm_missing_power_source",
+            "review_component_class_alternative",
+        }:
+            return True
+    return False
+
+
 def _positive_int_or_default(value: int | None, default: int) -> int:
     if value is None:
         return default
@@ -582,12 +1463,15 @@ def _needs_repair_prerequisite_tools(
 ) -> list[str]:
     required = []
     if _single_pin_net_ids_from_audit(audit_report):
-        if "get_single_pin_nets" not in completed_tool_names:
-            required.append("get_single_pin_nets")
-        if "get_terminal_attachments" not in completed_tool_names:
-            required.append("get_terminal_attachments")
-    if _audit_has_terminal_attachment_issue(audit_report) and "get_terminal_attachments" not in completed_tool_names:
-        required.append("get_terminal_attachments")
+        if not completed_tool_names.intersection({"get_single_pin_nets", "inspect_single_pin_nets"}):
+            required.append("inspect_single_pin_nets")
+        if not completed_tool_names.intersection({"get_terminal_attachments", "inspect_terminal_attachments"}):
+            required.append("inspect_terminal_attachments")
+    if (
+        _audit_has_terminal_attachment_issue(audit_report)
+        and not completed_tool_names.intersection({"get_terminal_attachments", "inspect_terminal_attachments"})
+    ):
+        required.append("inspect_terminal_attachments")
     return _as_id_list(required)
 
 
@@ -631,13 +1515,13 @@ def _rule_planner(
             notes.append(f"Single-pin nets: {', '.join(single_pin_net_ids)}.")
             if "get_single_pin_nets" not in completed_tool_names:
                 add_tool(
-                    "get_single_pin_nets",
+                    "inspect_single_pin_nets",
                     "Audit found single-pin nets; inspect affected nets and pins.",
                     {"net_ids": single_pin_net_ids},
                 )
-            if "get_terminal_attachments" not in completed_tool_names:
+            if "inspect_terminal_attachments" not in completed_tool_names:
                 add_tool(
-                    "get_terminal_attachments",
+                    "inspect_terminal_attachments",
                     "Inspect terminal attachment evidence around the single-pin nets.",
                     {"net_ids": single_pin_net_ids},
                 )
@@ -648,7 +1532,7 @@ def _rule_planner(
                 f"Terminal attachment issue targets pins: {', '.join(pin_ids) if pin_ids else 'all relevant pins'}."
             )
             add_tool(
-                "get_terminal_attachments",
+                "inspect_terminal_attachments",
                 "Audit points to terminal attachment confidence; inspect target pin evidence.",
                 {"pin_ids": pin_ids},
             )
@@ -660,6 +1544,13 @@ def _rule_planner(
                 "Audit mentions unsupported evidence; read deterministic review candidates.",
             )
 
+        if _audit_has_class_or_power_issue(audit_report):
+            notes.append("Class/power-source semantics should be checked against component class alternatives.")
+            add_tool(
+                "get_repair_candidates",
+                "Audit mentions a passive-or-missing-power-source case; inspect class ambiguity candidates.",
+            )
+
         if (
             _audit_has_actionable_issues(audit_report)
             and not _needs_repair_prerequisite_tools(audit_report, completed_tool_names)
@@ -669,6 +1560,8 @@ def _rule_planner(
             if single_pin_net_ids:
                 repair_arguments["net_ids"] = single_pin_net_ids
                 repair_arguments["repair_type"] = "merge"
+            repair_arguments["allow_bulk_fallback"] = True
+            repair_arguments["fallback_reason"] = "rule planner fallback"
             add_tool(
                 "repair_dry_run",
                 "Actionable audit issues exist; generate non-mutating repair candidates.",
@@ -694,6 +1587,7 @@ def _rule_planner(
         "stop_decision": "continue" if tool_calls else "final_ready",
         "hypotheses": [],
         "open_questions": [],
+        "deferred_questions": [],
         "guardrail_feedback": [],
         "llm_result": {
             "used": False,
@@ -745,6 +1639,13 @@ def _guard_planned_tool_calls(
     prerequisites = _needs_repair_prerequisite_tools(audit_report, completed_tool_names)
     for call in proposed:
         tool_name = call.get("tool_name")
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        if tool_name == "repair_dry_run" and not arguments.get("allow_bulk_fallback"):
+            feedback.append(
+                "Blocked legacy repair_dry_run. Use a granular dry-run tool first, "
+                "or set allow_bulk_fallback=true with a reason if no granular tool applies."
+            )
+            continue
         if tool_name == "repair_dry_run" and prerequisites:
             feedback.append(
                 "Blocked repair_dry_run until prerequisite evidence tools complete: "
@@ -752,8 +1653,56 @@ def _guard_planned_tool_calls(
                 + "."
             )
             continue
+        if tool_name in GRANULAR_DRY_RUN_TOOL_NAMES and not arguments.get("hypothesis_id"):
+            feedback.append(
+                f"Blocked {tool_name}; every granular dry-run call must include hypothesis_id."
+            )
+            continue
         guarded.append(call)
     return guarded[:max_tool_calls_per_step], feedback
+
+
+def _planner_self_consistency_feedback(
+    tool_calls: list[dict[str, Any]],
+    open_questions: list[str],
+    deferred_questions: list[dict[str, Any]],
+    completed_tool_names: set[str],
+) -> list[str]:
+    if tool_calls or not open_questions:
+        return []
+
+    feedback = []
+    deferred_text = " ".join(
+        str(item.get("question") or item.get("text") or item)
+        for item in deferred_questions
+        if isinstance(item, dict)
+    ).lower()
+    unresolved = [
+        question
+        for question in open_questions
+        if str(question).strip() and str(question).strip().lower() not in deferred_text
+    ]
+    if unresolved:
+        feedback.append(
+            "Planner left open_questions but selected no tool calls. Call the next relevant "
+            "tool, or move each unresolved question to deferred_questions with a concrete "
+            "artifact-based reason."
+        )
+
+    question_text = " ".join(open_questions).lower()
+    single_pin_terms = ("single-pin", "single pin", "one-pin", "stub", "isolated pin")
+    if (
+        any(term in question_text for term in single_pin_terms)
+        and not completed_tool_names.intersection(
+            {"inspect_single_pin_stub", "dry_run_single_pin_stub_bridge"}
+        )
+    ):
+        feedback.append(
+            "A single-pin/stub question remains unresolved. Use the single_pin_terminal_stub "
+            "tool family, typically inspect_single_pin_stub before "
+            "dry_run_single_pin_stub_bridge, or explicitly defer it with evidence."
+        )
+    return feedback
 
 
 def _plan_tool_calls(
@@ -793,8 +1742,9 @@ def _plan_tool_calls(
 
     payload = {
         "available_tools": _available_tools(),
+        "tool_families": _available_tool_families(),
         "observation": observation,
-        "audit_report": _compact_audit(audit_report),
+        "audit_context": observation.get("audit_context", {}),
         "completed_tool_names": sorted(completed_tool_names),
         "prior_tool_results": tool_results,
         "planner_feedback": planner_feedback,
@@ -824,16 +1774,34 @@ def _plan_tool_calls(
         return fallback
 
     content = llm_result.get("content", {}) if isinstance(llm_result.get("content"), dict) else {}
+    hypotheses = _as_dict_list(content.get("hypotheses"))
+    open_questions = _as_string_list(content.get("open_questions"))
+    deferred_questions = _as_dict_list(content.get("deferred_questions"))
     tool_calls = _normalize_tool_calls(
         content.get("tool_calls"),
         completed_tool_names=completed_tool_names,
         limit=max_tool_calls_per_step,
     )
+    if len(hypotheses) == 1 and hypotheses[0].get("id"):
+        for call in tool_calls:
+            if call.get("tool_name") in GRANULAR_DRY_RUN_TOOL_NAMES:
+                arguments = dict(call.get("arguments", {}))
+                if not arguments.get("hypothesis_id"):
+                    arguments["hypothesis_id"] = hypotheses[0]["id"]
+                    call["arguments"] = arguments
     tool_calls, guard_feedback = _guard_planned_tool_calls(
         tool_calls,
         audit_report,
         completed_tool_names,
         max_tool_calls_per_step,
+    )
+    guard_feedback.extend(
+        _planner_self_consistency_feedback(
+            tool_calls,
+            open_questions,
+            deferred_questions,
+            completed_tool_names,
+        )
     )
     planner_notes = content.get("planner_notes", [])
     if not isinstance(planner_notes, list):
@@ -849,8 +1817,9 @@ def _plan_tool_calls(
         "tool_calls": tool_calls,
         "planner_notes": planner_notes,
         "stop_decision": stop_decision,
-        "hypotheses": _as_string_list(content.get("hypotheses")),
-        "open_questions": _as_string_list(content.get("open_questions")),
+        "hypotheses": hypotheses,
+        "open_questions": open_questions,
+        "deferred_questions": deferred_questions,
         "guardrail_feedback": guard_feedback,
         "llm_result": llm_result,
     }
@@ -862,6 +1831,7 @@ def _execute_named_tool(
     audit_report: dict[str, Any] | None,
     call: dict[str, Any],
     index: int,
+    prior_tool_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     tool_name = call.get("tool_name")
     arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
@@ -897,16 +1867,16 @@ def _execute_named_tool(
             "result_summary": _compact_case_summary(doc if isinstance(doc, dict) else None),
         }
 
-    if tool_name == "get_single_pin_nets":
+    if tool_name in {"get_single_pin_nets", "inspect_single_pin_nets"}:
         net_ids = _as_id_list(arguments.get("net_ids")) or _single_pin_net_ids_from_audit(audit_report)
         return {
             **base_result,
             "result_summary": _single_pin_net_summary(debug_dir, audit_report, net_ids),
         }
 
-    if tool_name == "get_terminal_attachments":
-        pin_ids = _as_id_list(arguments.get("pin_ids"))
-        net_ids = _as_id_list(arguments.get("net_ids"))
+    if tool_name in {"get_terminal_attachments", "inspect_terminal_attachments"}:
+        pin_ids = _argument_ids(arguments, "pin_ids", "pin_id")
+        net_ids = _argument_ids(arguments, "net_ids", "net_id")
         if not pin_ids and net_ids:
             pin_ids = _pin_ids_for_net_ids(debug_dir, net_ids)
         doc = _read_json(_artifact_path(debug_dir, "terminal_attachments"))
@@ -922,6 +1892,71 @@ def _execute_named_tool(
             "result_summary": _compact_repair_candidates_doc(doc if isinstance(doc, dict) else None),
         }
 
+    if tool_name == "inspect_component_class_candidates":
+        return {
+            **base_result,
+            "result_summary": _inspect_component_class_candidates(debug_dir, arguments),
+        }
+
+    if tool_name == "inspect_component_terminal_axis":
+        return {
+            **base_result,
+            "result_summary": _inspect_component_terminal_axis(debug_dir, arguments),
+        }
+
+    if tool_name == "inspect_gap_bridge_candidates":
+        return {
+            **base_result,
+            "result_summary": _inspect_gap_bridge_candidates(debug_dir, arguments),
+        }
+
+    if tool_name == "inspect_single_pin_stub":
+        return {
+            **base_result,
+            "result_summary": _inspect_single_pin_stub(debug_dir, arguments),
+        }
+
+    if tool_name == "validate_candidate":
+        return {
+            **base_result,
+            "result_summary": _validate_candidate_from_tool_results(prior_tool_results or [], arguments),
+        }
+
+    if tool_name in GRANULAR_DRY_RUN_TOOL_NAMES:
+        tool_output_dir = output_dir / "tool_calls" / f"{index:02d}_{tool_name}"
+        tool_result = run_granular_repair_dry_run(
+            debug_dir,
+            tool_name,
+            arguments=arguments,
+            output_dir=tool_output_dir,
+        )
+        repair_report = tool_result.get("report", {})
+        hypothesis_id = arguments.get("hypothesis_id")
+        if hypothesis_id:
+            for candidate in repair_report.get("repair_candidates", []):
+                candidate["hypothesis_id"] = hypothesis_id
+                candidate.setdefault("geometry", {})["hypothesis_id"] = hypothesis_id
+            for group in repair_report.get("candidate_groups", {}).values():
+                if isinstance(group, list):
+                    for candidate in group:
+                        candidate["hypothesis_id"] = hypothesis_id
+                        candidate.setdefault("geometry", {})["hypothesis_id"] = hypothesis_id
+        return {
+            **base_result,
+            "outputs": tool_result.get("outputs", {}),
+            "result_summary": _compact_repair_report(
+                repair_report,
+                target_net_ids=_as_id_list(
+                    arguments.get("net_ids")
+                    or arguments.get("net_id")
+                    or arguments.get("node_ids")
+                    or arguments.get("node_id")
+                ),
+                target_pin_ids=_argument_ids(arguments, "pin_ids", "pin_id"),
+                repair_type=GRANULAR_TOOL_TO_REPAIR_TYPE.get(str(tool_name)),
+            ),
+        }
+
     tool_output_dir = output_dir / "tool_calls" / f"{index:02d}_repair_dry_run"
     tool_result = run_agent_repair_dry_run(debug_dir, output_dir=tool_output_dir)
     repair_report = tool_result.get("report", {})
@@ -930,8 +1965,8 @@ def _execute_named_tool(
         "outputs": tool_result.get("outputs", {}),
         "result_summary": _compact_repair_report(
             repair_report,
-            target_net_ids=_as_id_list(arguments.get("net_ids")),
-            target_pin_ids=_as_id_list(arguments.get("pin_ids")),
+            target_net_ids=_argument_ids(arguments, "net_ids", "net_id"),
+            target_pin_ids=_argument_ids(arguments, "pin_ids", "pin_id"),
             repair_type=str(arguments.get("repair_type")) if arguments.get("repair_type") else None,
         ),
     }
@@ -948,7 +1983,7 @@ def _target_context_from_tool_results(
     for result in tool_results:
         summary = result.get("result_summary", {})
         tool_name = result.get("tool_name")
-        if tool_name == "get_single_pin_nets" and summary.get("exists"):
+        if tool_name in {"get_single_pin_nets", "inspect_single_pin_nets"} and summary.get("exists"):
             before_nets = len(net_ids)
             before_pins = len(pin_ids)
             net_ids.extend(_as_id_list(summary.get("requested_net_ids")))
@@ -958,11 +1993,19 @@ def _target_context_from_tool_results(
             pin_ids.extend(_as_id_list(summary.get("related_pin_ids")))
             if len(net_ids) > before_nets or len(pin_ids) > before_pins:
                 sources.append("get_single_pin_nets")
-        elif tool_name == "get_terminal_attachments" and summary.get("exists"):
+        elif tool_name in {"get_terminal_attachments", "inspect_terminal_attachments"} and summary.get("exists"):
             before_pins = len(pin_ids)
             pin_ids.extend(_as_id_list(summary.get("requested_pin_ids")))
             if len(pin_ids) > before_pins:
                 sources.append("get_terminal_attachments")
+        elif tool_name == "inspect_single_pin_stub" and summary.get("exists"):
+            before_nets = len(net_ids)
+            before_pins = len(pin_ids)
+            for stub in summary.get("stubs", []):
+                net_ids.extend(_as_id_list(stub.get("node_id")))
+                pin_ids.extend(_as_id_list(stub.get("pin_id")))
+            if len(net_ids) > before_nets or len(pin_ids) > before_pins:
+                sources.append("inspect_single_pin_stub")
 
     if not net_ids:
         audit_net_ids = _single_pin_net_ids_from_audit(audit_report)
@@ -996,8 +2039,8 @@ def _ground_tool_call_arguments(
     context = _target_context_from_tool_results(audit_report, tool_results)
     tool_name = grounded.get("tool_name")
 
-    if tool_name == "get_terminal_attachments":
-        if not _as_id_list(arguments.get("pin_ids")) and not _as_id_list(arguments.get("net_ids")):
+    if tool_name in {"get_terminal_attachments", "inspect_terminal_attachments"}:
+        if not _argument_ids(arguments, "pin_ids", "pin_id") and not _argument_ids(arguments, "net_ids", "net_id"):
             if context["net_ids"]:
                 arguments["net_ids"] = context["net_ids"]
                 added["net_ids"] = context["net_ids"]
@@ -1017,6 +2060,70 @@ def _ground_tool_call_arguments(
             arguments["repair_type"] = context["repair_type"]
             added["repair_type"] = context["repair_type"]
 
+    if tool_name == "dry_run_component_class_override":
+        if not arguments.get("component_id") or not (
+            arguments.get("target_class") or arguments.get("alternate_class_name")
+        ):
+            for result in reversed(tool_results):
+                if result.get("tool_name") != "inspect_component_class_candidates":
+                    continue
+                components = result.get("result_summary", {}).get("components", [])
+                if len(components) != 1:
+                    continue
+                component = components[0]
+                alternatives = component.get("class_alternatives", [])
+                if not alternatives:
+                    continue
+                if not arguments.get("component_id"):
+                    arguments["component_id"] = component.get("component_id")
+                    added["component_id"] = component.get("component_id")
+                if not arguments.get("target_class") and not arguments.get("alternate_class_name"):
+                    arguments["target_class"] = alternatives[0].get("class_name")
+                    added["target_class"] = alternatives[0].get("class_name")
+                break
+
+    if tool_name == "dry_run_component_axis_flip":
+        if not arguments.get("component_id") or not (
+            arguments.get("target_axis") or arguments.get("alternate_axis")
+        ):
+            for result in reversed(tool_results):
+                if result.get("tool_name") != "inspect_component_terminal_axis":
+                    continue
+                components = result.get("result_summary", {}).get("components", [])
+                if len(components) != 1:
+                    continue
+                component = components[0]
+                if not arguments.get("component_id"):
+                    arguments["component_id"] = component.get("component_id")
+                    added["component_id"] = component.get("component_id")
+                if not arguments.get("target_axis") and not arguments.get("alternate_axis"):
+                    arguments["target_axis"] = component.get("alternate_axis")
+                    added["target_axis"] = component.get("alternate_axis")
+                break
+
+    if tool_name == "dry_run_single_pin_stub_bridge":
+        if not arguments.get("pin_id") or not arguments.get("target_node_id"):
+            for result in reversed(tool_results):
+                if result.get("tool_name") != "inspect_single_pin_stub":
+                    continue
+                stubs = result.get("result_summary", {}).get("stubs", [])
+                if not stubs:
+                    continue
+                stub = stubs[0]
+                nearby = stub.get("nearby_supported_nodes", [])
+                if not nearby:
+                    continue
+                if not arguments.get("pin_id"):
+                    arguments["pin_id"] = stub.get("pin_id")
+                    added["pin_id"] = stub.get("pin_id")
+                if not arguments.get("target_node_id"):
+                    arguments["target_node_id"] = nearby[0].get("node_id")
+                    added["target_node_id"] = nearby[0].get("node_id")
+                if not arguments.get("node_ids"):
+                    arguments["node_ids"] = [stub.get("node_id"), nearby[0].get("node_id")]
+                    added["node_ids"] = arguments["node_ids"]
+                break
+
     grounding = {
         "applied": bool(added),
         "source": ("prior_tool_results" if tool_results else "audit_context") if added else None,
@@ -1035,11 +2142,20 @@ def _invoke_tools(
     tool_calls: list[dict[str, Any]],
     start_index: int = 1,
     planner_iteration: int | None = None,
+    prior_tool_results: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     results = []
+    prior_tool_results = prior_tool_results or []
     for index, call in enumerate(tool_calls, start=start_index):
         try:
-            result = _execute_named_tool(debug_dir, output_dir, audit_report, call, index)
+            result = _execute_named_tool(
+                debug_dir,
+                output_dir,
+                audit_report,
+                call,
+                index,
+                prior_tool_results=prior_tool_results + results,
+            )
             result["planner_iteration"] = planner_iteration
             results.append(result)
         except Exception as exc:  # Keep the agent trace inspectable on tool failure.
@@ -1068,6 +2184,21 @@ def _completed_tool_names(tool_results: list[dict[str, Any]]) -> set[str]:
     }
 
 
+def _merge_hypotheses(hypotheses: list[Any]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for index, item in enumerate(_as_dict_list(hypotheses), start=1):
+        hypothesis_id = str(item.get("id") or item.get("hypothesis_id") or f"H{index}")
+        if hypothesis_id not in merged:
+            order.append(hypothesis_id)
+        merged[hypothesis_id] = {
+            **merged.get(hypothesis_id, {}),
+            **item,
+            "id": hypothesis_id,
+        }
+    return [merged[hypothesis_id] for hypothesis_id in order]
+
+
 def _aggregate_planner_steps(planner_steps: list[dict[str, Any]], stop_reason: str) -> dict[str, Any]:
     tool_calls = []
     notes = []
@@ -1076,6 +2207,7 @@ def _aggregate_planner_steps(planner_steps: list[dict[str, Any]], stop_reason: s
     planner_kinds = []
     hypotheses = []
     open_questions = []
+    deferred_questions = []
     guardrail_feedback = []
     for step in planner_steps:
         planner_kinds.append(str(step.get("planner_kind")))
@@ -1083,6 +2215,7 @@ def _aggregate_planner_steps(planner_steps: list[dict[str, Any]], stop_reason: s
         notes.extend(step.get("planner_notes", []))
         hypotheses.extend(step.get("hypotheses", []))
         open_questions.extend(step.get("open_questions", []))
+        deferred_questions.extend(step.get("deferred_questions", []))
         guardrail_feedback.extend(step.get("guardrail_feedback", []))
         llm_used = bool(llm_used or step.get("llm_used"))
         if step.get("llm_result"):
@@ -1096,8 +2229,10 @@ def _aggregate_planner_steps(planner_steps: list[dict[str, Any]], stop_reason: s
         "planner_notes": notes,
         "planner_steps": planner_steps,
         "stop_reason": stop_reason,
-        "hypotheses": _as_string_list(hypotheses),
+        "hypotheses": _merge_hypotheses(hypotheses),
+        "hypothesis_history": _as_dict_list(hypotheses),
         "open_questions": _as_string_list(open_questions),
+        "deferred_questions": _as_dict_list(deferred_questions),
         "guardrail_feedback": _as_string_list(guardrail_feedback),
         "llm_result": llm_results[-1] if llm_results else {"used": False, "error": None},
         "llm_results": llm_results,
@@ -1181,6 +2316,7 @@ def _run_planner_tool_loop(
             calls,
             start_index=len(tool_results) + 1,
             planner_iteration=iteration,
+            prior_tool_results=tool_results,
         )
         tool_results.extend(new_results)
         if any(result.get("tool_name") == "repair_dry_run" for result in new_results):
@@ -1210,7 +2346,15 @@ def _top_candidate(tool_results: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _repair_dry_run_called(tool_results: list[dict[str, Any]]) -> bool:
-    return any(result.get("tool_name") == "repair_dry_run" for result in tool_results)
+    return any(
+        result.get("tool_name") == "repair_dry_run"
+        or result.get("tool_name") in GRANULAR_DRY_RUN_TOOL_NAMES
+        for result in tool_results
+    )
+
+
+def _candidate_is_applyable(candidate: dict[str, Any] | None) -> bool:
+    return isinstance(candidate, dict) and candidate.get("repair_type") in APPLYABLE_REPAIR_TYPES
 
 
 def _critic_review(
@@ -1222,13 +2366,38 @@ def _critic_review(
     result_names = {result.get("tool_name") for result in tool_results if result.get("status") == "completed"}
     issues = []
     notes = []
+    dry_run_names = set(GRANULAR_DRY_RUN_TOOL_NAMES) | {"repair_dry_run"}
 
-    if _audit_has_actionable_issues(audit_report) and "repair_dry_run" not in called_names:
-        issues.append("Actionable audit issues exist but repair_dry_run was not planned.")
-    if _single_pin_net_ids_from_audit(audit_report) and "get_single_pin_nets" not in called_names:
-        issues.append("Single-pin nets exist but get_single_pin_nets was not planned.")
-    if _audit_has_terminal_attachment_issue(audit_report) and "get_terminal_attachments" not in called_names:
-        issues.append("Terminal attachment issue exists but get_terminal_attachments was not planned.")
+    if _audit_has_actionable_issues(audit_report) and not called_names.intersection(dry_run_names):
+        issues.append("Actionable audit issues exist but no dry-run validation tool was planned.")
+    if (
+        _single_pin_net_ids_from_audit(audit_report)
+        and not called_names.intersection(
+            {
+                "inspect_single_pin_nets",
+                "get_single_pin_nets",
+                "inspect_single_pin_stub",
+                "dry_run_merge_nodes",
+                "dry_run_single_pin_stub_bridge",
+            }
+        )
+        and not _top_candidate(tool_results)
+    ):
+        issues.append("Single-pin nets exist but no single-pin/stub inspection or merge dry-run was planned.")
+    if (
+        _audit_has_terminal_attachment_issue(audit_report)
+        and not called_names.intersection(
+            {
+                "inspect_terminal_attachments",
+                "get_terminal_attachments",
+                "inspect_component_terminal_axis",
+                "dry_run_component_axis_flip",
+                "dry_run_reattach_pin",
+            }
+        )
+        and not _top_candidate(tool_results)
+    ):
+        issues.append("Terminal attachment signals exist but no terminal inspection or terminal repair dry-run was planned.")
     if called_names - result_names:
         issues.append(f"Some planned tools did not complete: {', '.join(sorted(called_names - result_names))}.")
 
@@ -1265,27 +2434,32 @@ def _rule_review(
 ) -> dict[str, Any]:
     top = _top_candidate(tool_results)
     repair_called = _repair_dry_run_called(tool_results)
+    candidate_lookup = _candidate_lookup_from_tool_results(tool_results)
     if critic.get("issues"):
         decision = "needs_more_evidence"
-        selected = []
+        selected_ids = []
         rationale = "Guardrail critic found issues in the planned or executed tool sequence."
     elif not planner.get("tool_calls") or (
         not repair_called and not _audit_has_actionable_issues(audit_report)
     ):
         decision = "no_action"
-        selected = []
+        selected_ids = []
         rationale = "No actionable audit issue required repair dry-run."
     elif repair_called and not top:
         decision = "no_candidate_found"
-        selected = []
+        selected_ids = []
         rationale = "Repair dry-run returned no actionable ranked candidates."
     elif top and top.get("recommendation") == "accept_for_human_review":
-        decision = "candidate_ready_for_human_review"
-        selected = [str(top.get("candidate_id"))]
+        decision = (
+            "repair_candidate_ready_for_human_review"
+            if _candidate_is_applyable(top)
+            else "review_only_issue_for_human_review"
+        )
+        selected_ids = [str(top.get("candidate_id"))]
         rationale = f"Top candidate {top.get('candidate_id')} is validated and ranked for human review."
     else:
         decision = "needs_more_evidence"
-        selected = [str(top.get("candidate_id"))] if top and top.get("candidate_id") else []
+        selected_ids = [str(top.get("candidate_id"))] if top and top.get("candidate_id") else []
         rationale = f"Top candidate {top.get('candidate_id') if top else None} needs more evidence."
 
     facts = [
@@ -1304,13 +2478,15 @@ def _rule_review(
         "reviewer_kind": "rule",
         "llm_used": False,
         "final_decision": decision,
-        "selected_candidate_ids": selected,
+        "repair_plan": _repair_plan_from_candidate_ids(selected_ids, candidate_lookup),
+        "selected_hypothesis_ids": [],
         "rationale": rationale,
         "confirmed_by_artifacts": facts,
         "risks": critic.get("issues", []),
         "next_actions": [
             "Open the dry-run report and confirm the selected candidate before any topology correction."
-        ] if selected else ["No topology correction is recommended by this advisor run."],
+        ] if selected_ids else ["No topology correction is recommended by this advisor run."],
+        "hypothesis_assessment": [],
         "llm_result": {
             "used": False,
             "error": None,
@@ -1322,37 +2498,45 @@ def _normalize_review_content(
     content: dict[str, Any],
     known_ids: set[str],
     fallback: dict[str, Any],
+    candidate_lookup: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     allowed_decisions = {
-        "candidate_ready_for_human_review",
+        "repair_candidate_ready_for_human_review",
+        "review_only_issue_for_human_review",
         "needs_more_evidence",
         "no_candidate_found",
         "no_action",
     }
     decision = str(content.get("final_decision") or fallback["final_decision"])
+    if decision == "candidate_ready_for_human_review":
+        decision = str(fallback.get("final_decision") or "review_only_issue_for_human_review")
     if decision not in allowed_decisions:
         decision = fallback["final_decision"]
     if (
-        fallback.get("final_decision") == "candidate_ready_for_human_review"
+        fallback.get("final_decision") in {
+            "repair_candidate_ready_for_human_review",
+            "review_only_issue_for_human_review",
+        }
         and decision in {"no_action", "no_candidate_found"}
     ):
         decision = fallback["final_decision"]
-    selected = [
-        str(candidate_id)
-        for candidate_id in content.get("selected_candidate_ids", [])
-        if str(candidate_id) in known_ids
-    ]
-    if decision == "candidate_ready_for_human_review" and not selected:
-        selected = list(fallback.get("selected_candidate_ids", []))
+    repair_plan = _normalize_repair_plan(content, candidate_lookup, fallback)
+    if decision in {
+        "repair_candidate_ready_for_human_review",
+        "review_only_issue_for_human_review",
+    } and not _repair_plan_candidate_ids(repair_plan):
+        repair_plan = fallback.get("repair_plan", {"plan_id": "PLAN1", "status": "no_repair_plan", "steps": []})
     return {
         "final_decision": decision,
-        "selected_candidate_ids": selected,
+        "repair_plan": repair_plan,
+        "selected_hypothesis_ids": _as_id_list(content.get("selected_hypothesis_ids")),
         "rationale": str(content.get("rationale") or fallback["rationale"]),
         "confirmed_by_artifacts": _as_string_list(
             content.get("confirmed_by_artifacts") or fallback["confirmed_by_artifacts"]
         ),
         "risks": _as_string_list(content.get("risks") or fallback["risks"]),
         "next_actions": _as_string_list(content.get("next_actions") or fallback["next_actions"]),
+        "hypothesis_assessment": _as_dict_list(content.get("hypothesis_assessment")),
     }
 
 
@@ -1390,11 +2574,12 @@ def _review_tool_results(
     fallback = _rule_review(audit_report, planner, tool_results, critic)
     payload = {
         "observation": observation,
-        "audit_report": _compact_audit(audit_report),
+        "audit_context": observation.get("audit_context", {}),
         "planner": {
             "planner_kind": planner.get("planner_kind"),
             "tool_calls": planner.get("tool_calls", []),
             "planner_notes": planner.get("planner_notes", []),
+            "hypotheses": planner.get("hypotheses", []),
         },
         "tool_results": tool_results,
         "critic": critic,
@@ -1416,7 +2601,13 @@ def _review_tool_results(
         fallback["reviewer_kind"] = "rule_fallback"
         fallback["llm_result"] = llm_result
         return fallback
-    normalized = _normalize_review_content(content, _known_candidate_ids(tool_results), fallback)
+    candidate_lookup = _candidate_lookup_from_tool_results(tool_results)
+    normalized = _normalize_review_content(content, _known_candidate_ids(tool_results), fallback, candidate_lookup)
+    if not normalized.get("selected_hypothesis_ids"):
+        normalized["selected_hypothesis_ids"] = _hypothesis_ids_from_candidate_ids(
+            tool_results,
+            _repair_plan_candidate_ids(normalized.get("repair_plan")),
+        )
     return {
         "reviewer_kind": "llm",
         "llm_used": True,
@@ -1554,7 +2745,9 @@ def _build_agent_trace(state: dict[str, Any]) -> list[dict[str, Any]]:
                 "summary": {
                     "reviewer_kind": state.get("reviewer", {}).get("reviewer_kind"),
                     "final_decision": state.get("reviewer", {}).get("final_decision"),
-                    "selected_candidate_ids": state.get("reviewer", {}).get("selected_candidate_ids", []),
+                    "repair_plan_step_count": len(
+                        state.get("reviewer", {}).get("repair_plan", {}).get("steps", [])
+                    ),
                 },
             },
         ]
@@ -1573,14 +2766,17 @@ def _build_human_review_dossier(
 
     for result in tool_results:
         summary = result.get("result_summary", {})
-        if result.get("tool_name") == "get_single_pin_nets" and summary.get("exists"):
+        if result.get("tool_name") in {"get_single_pin_nets", "inspect_single_pin_nets"} and summary.get("exists"):
             single_pin_summary = summary
-        if result.get("tool_name") == "get_terminal_attachments" and summary.get("exists"):
+        if result.get("tool_name") in {"get_terminal_attachments", "inspect_terminal_attachments"} and summary.get("exists"):
             for attachment in summary.get("attachments", []):
                 pin_id = attachment.get("pin_id")
                 if pin_id:
                     attachments_by_pin[str(pin_id)] = attachment
-        if result.get("tool_name") == "repair_dry_run" and summary.get("exists"):
+        if (
+            result.get("tool_name") == "repair_dry_run"
+            or result.get("tool_name") in GRANULAR_DRY_RUN_TOOL_NAMES
+        ) and summary.get("exists"):
             candidates.extend(summary.get("top_candidates", []))
 
     pin_details_by_net: dict[str, list[dict[str, Any]]] = {}
@@ -1618,12 +2814,29 @@ def _build_human_review_dossier(
             }
         )
 
-    selected_ids = set(_as_id_list(reviewer.get("selected_candidate_ids")))
+    repair_plan = reviewer.get("repair_plan", {"plan_id": "PLAN1", "status": "no_repair_plan", "steps": []})
+    selected_ids = set(_repair_plan_candidate_ids(repair_plan))
     selected_candidates = [
         candidate for candidate in candidates if str(candidate.get("candidate_id")) in selected_ids
     ]
-    if not selected_candidates and candidates:
-        selected_candidates = candidates[:1]
+    selected_by_id = {str(candidate.get("candidate_id")): candidate for candidate in selected_candidates}
+    plan_steps = []
+    for step in repair_plan.get("steps", []) if isinstance(repair_plan, dict) else []:
+        if not isinstance(step, dict):
+            continue
+        candidate_id = str(step.get("candidate_id") or "")
+        plan_steps.append(
+            {
+                **{key: value for key, value in step.items() if key != "candidate"},
+                "candidate": selected_by_id.get(candidate_id) or step.get("candidate"),
+            }
+        )
+    applyable_candidates = [
+        candidate for candidate in candidates if candidate.get("candidate_mode") == "applyable"
+    ]
+    review_only_candidates = [
+        candidate for candidate in candidates if candidate.get("candidate_mode") == "review_only"
+    ]
 
     return {
         "schema_version": "3.4-human-review-dossier",
@@ -1631,14 +2844,21 @@ def _build_human_review_dossier(
         "primary_issue": audit_report.get("primary_issue") if audit_report else None,
         "suspected_stage": audit_report.get("suspected_stage") if audit_report else None,
         "final_decision": reviewer.get("final_decision"),
-        "selected_candidate_ids": reviewer.get("selected_candidate_ids", []),
+        "repair_plan": {
+            **repair_plan,
+            "steps": plan_steps,
+        },
         "plain_language_summary": (
-            "The advisor found single-pin nets and a dry-run merge candidate that should be reviewed by a human."
+            "The advisor prepared a dry-run repair plan that should be reviewed by a human."
             if selected_candidates
-            else "The advisor did not find a selected repair candidate for this run."
+            else "The advisor did not prepare a repair plan for this run."
         ),
         "nets": nets,
         "selected_candidates": selected_candidates,
+        "candidate_groups": {
+            "applyable": applyable_candidates[:8],
+            "review_only": review_only_candidates[:8],
+        },
         "confidence_cues": [
             "single-pin nets are measured from netlist pin counts",
             "terminal attachment scores come from terminal-to-evidence corridor matching",
@@ -1659,7 +2879,8 @@ def render_human_review_dossier_markdown(dossier: dict[str, Any]) -> str:
         f"# Human Review Dossier: {dossier.get('case_id')}",
         "",
         f"- final decision: `{dossier.get('final_decision')}`",
-        f"- selected candidates: `{dossier.get('selected_candidate_ids')}`",
+        f"- repair plan: `{dossier.get('repair_plan', {}).get('plan_id')}` "
+        f"status=`{dossier.get('repair_plan', {}).get('status')}`",
         f"- primary issue: `{dossier.get('primary_issue')}`",
         f"- suspected stage: `{dossier.get('suspected_stage')}`",
         "",
@@ -1686,13 +2907,18 @@ def render_human_review_dossier_markdown(dossier: dict[str, Any]) -> str:
                 f"score=`{attachment.get('best_attachment_score')}`"
             )
 
-    lines.extend(["", "## Selected Candidate", ""])
-    if not dossier.get("selected_candidates"):
-        lines.append("- No selected candidate.")
-    for candidate in dossier.get("selected_candidates", []):
+    lines.extend(["", "## Repair Plan", ""])
+    plan_steps = dossier.get("repair_plan", {}).get("steps", [])
+    if not plan_steps:
+        lines.append("- No repair plan.")
+    for step in plan_steps:
+        candidate = step.get("candidate", {}) if isinstance(step, dict) else {}
         lines.append(
-            f"- `{candidate.get('candidate_id')}` / `{candidate.get('repair_type')}`: "
-            f"recommendation=`{candidate.get('recommendation')}`, "
+            f"- `{step.get('step_id')}` candidate=`{step.get('candidate_id')}` / `{step.get('repair_type')}` "
+            f"depends_on=`{step.get('depends_on', [])}`"
+        )
+        lines.append(
+            f"  - recommendation=`{candidate.get('recommendation')}`, "
             f"validation=`{candidate.get('validation_result')}`, "
             f"ranking_score=`{candidate.get('ranking_score')}`"
         )
@@ -1706,6 +2932,22 @@ def render_human_review_dossier_markdown(dossier: dict[str, Any]) -> str:
             lines.append("  - reasons:")
             for reason in candidate.get("reasons", [])[:6]:
                 lines.append(f"    - {reason}")
+
+    groups = dossier.get("candidate_groups", {})
+    if groups:
+        lines.extend(["", "## Candidate Groups", ""])
+        lines.append(f"- applyable: `{len(groups.get('applyable', []))}`")
+        for candidate in groups.get("applyable", [])[:5]:
+            lines.append(
+                f"  - `{candidate.get('candidate_id')}` / `{candidate.get('repair_type')}` "
+                f"ranking_score=`{candidate.get('ranking_score')}`"
+            )
+        lines.append(f"- review_only: `{len(groups.get('review_only', []))}`")
+        for candidate in groups.get("review_only", [])[:5]:
+            lines.append(
+                f"  - `{candidate.get('candidate_id')}` / `{candidate.get('repair_type')}` "
+                f"ranking_score=`{candidate.get('ranking_score')}`"
+            )
 
     lines.extend(["", "## Confidence Cues", ""])
     for cue in dossier.get("confidence_cues", []):
@@ -1730,7 +2972,8 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
         f"- backend: `{report.get('backend')}`",
         f"- LLM used: `{report.get('llm_used')}`",
         f"- final decision: `{report.get('final_decision')}`",
-        f"- selected candidates: `{report.get('selected_candidate_ids')}`",
+        f"- repair plan: `{report.get('repair_plan', {}).get('plan_id')}` "
+        f"status=`{report.get('repair_plan', {}).get('status')}`",
         f"- topology mutated: `{report.get('topology_mutated')}`",
         "",
         "## Agent Trace",
@@ -1742,6 +2985,16 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## Planner", ""])
     lines.append(f"- planner kind: `{planner.get('planner_kind')}`")
     lines.append(f"- stop reason: `{planner.get('stop_reason')}`")
+    if planner.get("hypotheses"):
+        lines.append("- hypotheses:")
+        for hypothesis in planner.get("hypotheses", [])[:8]:
+            if isinstance(hypothesis, dict):
+                lines.append(
+                    f"  - `{hypothesis.get('id')}`: {hypothesis.get('claim')} "
+                    f"(uncertainty=`{hypothesis.get('uncertainty')}`)"
+                )
+            else:
+                lines.append(f"  - {hypothesis}")
     if planner.get("planner_steps"):
         lines.append("- planner iterations:")
         for step in planner.get("planner_steps", []):
@@ -1752,6 +3005,16 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
             )
             for feedback in step.get("guardrail_feedback", []):
                 lines.append(f"    - guardrail: {feedback}")
+            for question in step.get("open_questions", [])[:3]:
+                lines.append(f"    - open question: {question}")
+            for item in step.get("deferred_questions", [])[:3]:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"    - deferred: {item.get('question') or item.get('text')} "
+                        f"({item.get('reason')})"
+                    )
+                else:
+                    lines.append(f"    - deferred: {item}")
     for call in planner.get("tool_calls", []):
         lines.append(
             f"- tool call: `{call.get('tool_name')}` args=`{call.get('arguments', {})}` - {call.get('reason')}"
@@ -1770,15 +3033,30 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
     for result in report.get("tool_results", []):
         summary = result.get("result_summary", {})
         tool_name = result.get("tool_name")
-        if tool_name == "get_terminal_attachments":
+        if tool_name in {"get_terminal_attachments", "inspect_terminal_attachments"}:
             metric_label = "attachments"
             metric_count = summary.get("attachment_count", len(summary.get("attachments", [])))
-        elif tool_name == "get_single_pin_nets":
+        elif tool_name in {"get_single_pin_nets", "inspect_single_pin_nets"}:
             metric_label = "single_pin_nets"
             metric_count = summary.get("single_pin_net_count", len(summary.get("nets", [])))
         elif tool_name == "get_repair_candidates":
             metric_label = "review_candidates"
             metric_count = summary.get("summary", {}).get("candidate_count", len(summary.get("candidates", [])))
+        elif tool_name == "inspect_component_class_candidates":
+            metric_label = "components"
+            metric_count = summary.get("component_count", len(summary.get("components", [])))
+        elif tool_name == "inspect_component_terminal_axis":
+            metric_label = "components"
+            metric_count = summary.get("component_count", len(summary.get("components", [])))
+        elif tool_name == "inspect_gap_bridge_candidates":
+            metric_label = "bridge_candidates"
+            metric_count = summary.get("bridge_candidate_count", len(summary.get("candidates", [])))
+        elif tool_name == "inspect_single_pin_stub":
+            metric_label = "stubs"
+            metric_count = summary.get("stub_count", len(summary.get("stubs", [])))
+        elif tool_name == "validate_candidate":
+            metric_label = "candidate"
+            metric_count = 1 if summary.get("exists") else 0
         else:
             metric_label = "candidates"
             metric_count = (
@@ -1798,6 +3076,7 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
         for candidate in summary.get("top_candidates", [])[:5]:
             lines.append(
                 f"  - `{candidate.get('candidate_id')}` / `{candidate.get('repair_type')}` "
+                f"mode=`{candidate.get('candidate_mode')}` "
                 f"rank=`{candidate.get('rank')}` ranking_score=`{candidate.get('ranking_score')}` "
                 f"validation=`{candidate.get('validation_result')}` recommendation=`{candidate.get('recommendation')}`"
             )
@@ -1812,7 +3091,23 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
 
     lines.extend(["", "## Reviewer", ""])
     lines.append(f"- reviewer kind: `{reviewer.get('reviewer_kind')}`")
+    if reviewer.get("repair_plan"):
+        plan = reviewer.get("repair_plan", {})
+        lines.append(f"- repair plan: `{plan.get('plan_id')}` status=`{plan.get('status')}`")
+        for step in plan.get("steps", [])[:8]:
+            lines.append(
+                f"  - `{step.get('step_id')}` candidate=`{step.get('candidate_id')}` "
+                f"type=`{step.get('repair_type')}` depends_on=`{step.get('depends_on', [])}`"
+            )
+    if reviewer.get("selected_hypothesis_ids"):
+        lines.append(f"- selected hypotheses: `{reviewer.get('selected_hypothesis_ids')}`")
     lines.append(f"- rationale: {reviewer.get('rationale')}")
+    if reviewer.get("hypothesis_assessment"):
+        lines.append("- hypothesis assessment:")
+        for item in reviewer.get("hypothesis_assessment", [])[:8]:
+            lines.append(
+                f"  - `{item.get('hypothesis_id')}` status=`{item.get('status')}`: {item.get('reason')}"
+            )
     if reviewer.get("confirmed_by_artifacts"):
         lines.append("- confirmed by artifacts:")
         for item in reviewer.get("confirmed_by_artifacts", []):
@@ -1833,9 +3128,10 @@ def render_repair_advisor_markdown(report: dict[str, Any]) -> str:
                 f"- `{net.get('net_id')}` means pins `{net.get('pin_refs')}` "
                 f"on components `{net.get('component_refs')}`"
             )
-        for candidate in dossier.get("selected_candidates", [])[:3]:
+        for step in dossier.get("repair_plan", {}).get("steps", [])[:3]:
+            candidate = step.get("candidate", {}) if isinstance(step, dict) else {}
             lines.append(
-                f"- selected `{candidate.get('candidate_id')}` targets nodes "
+                f"- plan step `{step.get('step_id')}` candidate `{step.get('candidate_id')}` targets nodes "
                 f"`{candidate.get('target_nodes', [])}` and pins `{candidate.get('target_pins', [])}`"
             )
     if planner.get("llm_result", {}).get("error") or reviewer.get("llm_result", {}).get("error"):
@@ -1875,6 +3171,7 @@ def _build_report(state: dict[str, Any]) -> dict[str, Any]:
         state.get("tool_results", []),
         reviewer,
     )
+    repair_plan = reviewer.get("repair_plan", {"plan_id": "PLAN1", "status": "no_repair_plan", "steps": []})
     return {
         "schema_version": SCHEMA_VERSION,
         "case_id": audit_report.get("case_id") if audit_report else Path(state["debug_dir"]).name,
@@ -1907,7 +3204,8 @@ def _build_report(state: dict[str, Any]) -> dict[str, Any]:
         "agent_trace": _scrub_secrets(trace),
         "human_review_dossier": _scrub_secrets(human_review_dossier),
         "final_decision": reviewer.get("final_decision"),
-        "selected_candidate_ids": reviewer.get("selected_candidate_ids", []),
+        "repair_plan": _scrub_secrets(repair_plan),
+        "selected_hypothesis_ids": reviewer.get("selected_hypothesis_ids", []),
     }
 
 
@@ -2146,6 +3444,7 @@ def _run_langgraph(
             calls,
             start_index=len(state.get("tool_results", [])) + 1,
             planner_iteration=int(state.get("current_iteration") or 0),
+            prior_tool_results=list(state.get("tool_results", [])),
         )
         state["pending_tool_results"] = new_results
         _record_graph_event(
@@ -2265,7 +3564,9 @@ def _run_langgraph(
             summary={
                 "reviewer_kind": state.get("reviewer", {}).get("reviewer_kind"),
                 "final_decision": state.get("reviewer", {}).get("final_decision"),
-                "selected_candidate_ids": state.get("reviewer", {}).get("selected_candidate_ids", []),
+                "repair_plan_step_count": len(
+                    state.get("reviewer", {}).get("repair_plan", {}).get("steps", [])
+                ),
             },
         )
         return state
@@ -2357,7 +3658,7 @@ def run_agent_repair_advisor_workflow(
     memory_file: str | Path | None = None,
     memory_limit: int = 5,
 ) -> dict[str, Any]:
-    """Run the agent 3.4 LangGraph-native tool state machine advisor workflow."""
+    """Run the hypothesis-driven agent repair advisor workflow."""
     if backend not in {"rule", "mock", "openai", "deepseek", "custom"}:
         raise ValueError(f"Unknown backend: {backend}")
     if audit_backend not in {"rule", "mock", "openai", "deepseek", "custom"}:

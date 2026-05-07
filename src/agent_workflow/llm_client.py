@@ -335,8 +335,8 @@ def complete_json(
             "content": {
                 "summary": "Mock LLM response; no external model was called.",
                 "tool_calls": [{"tool_name": "repair_dry_run", "reason": "Mock planner selected the repair tool."}],
-                "final_decision": "mock_review",
-                "selected_candidate_ids": [],
+                "final_decision": "no_action",
+                "repair_plan": {"plan_id": "PLAN1", "status": "no_repair_plan", "steps": []},
                 "rationale": "Mock backend was selected.",
                 "confirmed_by_artifacts": [],
                 "risks": [],

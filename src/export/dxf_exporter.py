@@ -14,6 +14,38 @@ from src.export.layout_engine import normalize_layout
 from src.io_utils.json_io import save_json
 
 
+LAYER_DEFS = {
+    "WIRES": {"color": 2, "lineweight": 25},
+    "COMPONENTS": {"color": 7, "lineweight": 35},
+    "LABELS": {"color": 3, "lineweight": 18},
+    "NETS": {"color": 5, "lineweight": 18},
+    "PINS": {"color": 1, "lineweight": 13},
+    "NODES": {"color": 6, "lineweight": 18},
+    "JUNCTIONS": {"color": 6, "lineweight": 30},
+    "TITLE": {"color": 8, "lineweight": 13},
+    "REPAIR": {"color": 30, "lineweight": 13},
+}
+
+
+def _export_cfg(config: dict) -> dict:
+    return config.get("export", {})
+
+
+def _dxf_mode(config: dict) -> str:
+    return str(_export_cfg(config).get("dxf_mode", "clean")).lower()
+
+
+def _is_clean_mode(config: dict) -> bool:
+    return _dxf_mode(config) == "clean"
+
+
+def _export_bool(config: dict, key: str, clean_default: bool, debug_default: bool) -> bool:
+    export_cfg = _export_cfg(config)
+    if export_cfg.get(key) is not None:
+        return bool(export_cfg[key])
+    return clean_default if _is_clean_mode(config) else debug_default
+
+
 def _cad_point(x: float, y: float, max_y: float) -> tuple[float, float]:
     return float(x), float(max_y - y)
 
@@ -178,14 +210,32 @@ def _draw_pin_markers(msp, pin_groups: list[dict], max_y: float) -> None:
             _add_text(msp, label, (x + 2.5, y - 2.5), 2.5, "PINS")
 
 
-def _draw_node_markers(msp, nodes: list[dict], nets: list[dict], max_y: float) -> None:
+def _draw_node_markers(
+    msp,
+    nodes: list[dict],
+    nets: list[dict],
+    max_y: float,
+    show_labels: bool,
+) -> None:
     net_names = {net.get("net_id"): net.get("name", net.get("net_id")) for net in nets}
     for node in nodes:
         x, y = _cad_point(node.get("x", 0), node.get("y", 0), max_y)
         msp.add_circle((x, y), radius=2.2, dxfattribs={"layer": "NODES"})
-        node_id = node.get("node_id")
-        label = net_names.get(node_id, node_id)
-        _add_text(msp, label, (x + 4.0, y + 4.0), 4.0, "NETS")
+        if show_labels:
+            node_id = node.get("node_id")
+            label = net_names.get(node_id, node_id)
+            _add_text(msp, label, (x + 4.0, y + 4.0), 4.0, "NETS")
+
+
+def _draw_junction_dots(msp, nodes: list[dict], max_y: float) -> None:
+    for node in nodes:
+        pin_count = int(node.get("terminal_support_count", len(node.get("pin_ids", [])) or 0))
+        component_count = len(node.get("component_ids", []))
+        has_junction = bool(node.get("junction_ids"))
+        if pin_count < 3 and component_count < 3 and not has_junction:
+            continue
+        x, y = _cad_point(node.get("x", 0), node.get("y", 0), max_y)
+        msp.add_circle((x, y), radius=2.8, dxfattribs={"layer": "JUNCTIONS"})
 
 
 def _drawing_bounds(topology: dict, max_y: float) -> tuple[float, float, float, float]:
@@ -251,6 +301,7 @@ def export_to_dxf(topology_result: dict, config: dict) -> dict:
     """Export the recovered circuit as a minimal but readable DXF document."""
     export_errors: list[str] = []
     output_stem = _resolve_output_stem(config)
+    dxf_mode = _dxf_mode(config)
     output_path = OUTPUTS_DIR / "dxf" / f"{output_stem}.dxf"
     netlist_path = OUTPUTS_DIR / "netlist" / f"{output_stem}_netlist.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,18 +315,15 @@ def export_to_dxf(topology_result: dict, config: dict) -> dict:
 
         doc = ezdxf.new(dxfversion="R2010")
         doc.units = 4  # millimeters
-        for layer_name, color in (
-            ("WIRES", 2),
-            ("COMPONENTS", 7),
-            ("LABELS", 3),
-            ("NETS", 5),
-            ("PINS", 1),
-            ("NODES", 6),
-            ("TITLE", 8),
-            ("REPAIR", 30),
-        ):
+        for layer_name, attrs in LAYER_DEFS.items():
+            color = int(attrs["color"])
+            lineweight = int(attrs["lineweight"])
             if layer_name not in doc.layers:
-                doc.layers.add(layer_name, color=color)
+                doc.layers.add(layer_name, color=color, lineweight=lineweight)
+            else:
+                layer = doc.layers.get(layer_name)
+                layer.dxf.color = color
+                layer.dxf.lineweight = lineweight
 
         msp = doc.modelspace()
         wires = normalized_topology.get("wires", [])
@@ -299,13 +347,25 @@ def export_to_dxf(topology_result: dict, config: dict) -> dict:
             pin_group = pin_groups.get(component_id, {})
             axis = _component_axis(pin_groups, component_id)
             _draw_component_symbol(msp, component, pin_group, max_y)
-            label_x, label_y = _component_label_anchor(component, axis, max_y)
-            label = component.get("refdes", component_id)
-            _add_text(msp, label, (label_x, label_y), 6.0, "LABELS")
+            if _export_bool(config, "dxf_show_component_labels", True, True):
+                label_x, label_y = _component_label_anchor(component, axis, max_y)
+                label = component.get("refdes", component_id)
+                _add_text(msp, label, (label_x, label_y), 5.0 if _is_clean_mode(config) else 6.0, "LABELS")
 
-        _draw_pin_markers(msp, list(pin_groups.values()), max_y)
-        _draw_node_markers(msp, nodes, normalized_topology.get("nets", []), max_y)
-        _draw_title_block(msp, normalized_topology, output_stem, max_y)
+        if _export_bool(config, "dxf_show_junction_dots", True, True):
+            _draw_junction_dots(msp, nodes, max_y)
+        if _export_bool(config, "dxf_show_pin_markers", False, True):
+            _draw_pin_markers(msp, list(pin_groups.values()), max_y)
+        if _export_bool(config, "dxf_show_node_markers", False, True):
+            _draw_node_markers(
+                msp,
+                nodes,
+                normalized_topology.get("nets", []),
+                max_y,
+                show_labels=_export_bool(config, "dxf_show_net_labels", False, True),
+            )
+        if _export_bool(config, "dxf_show_title_block", False, True):
+            _draw_title_block(msp, normalized_topology, output_stem, max_y)
 
         doc.saveas(output_path)
         return {
@@ -313,6 +373,8 @@ def export_to_dxf(topology_result: dict, config: dict) -> dict:
             "json_path": str(netlist_path),
             "export_success": True,
             "export_errors": export_errors,
+            "dxf_mode": dxf_mode,
+            "layout": normalized_topology.get("export_layout", {}),
         }
     except Exception as exc:  # pragma: no cover
         export_errors.append(str(exc))
@@ -321,4 +383,6 @@ def export_to_dxf(topology_result: dict, config: dict) -> dict:
             "json_path": str(netlist_path),
             "export_success": False,
             "export_errors": export_errors,
+            "dxf_mode": dxf_mode,
+            "layout": normalized_topology.get("export_layout", {}),
         }

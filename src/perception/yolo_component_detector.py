@@ -98,6 +98,49 @@ def _dedupe_overlapping_proposals(
     return kept_in_original_order, suppressed
 
 
+def _class_candidate(
+    proposal: dict[str, Any],
+    status: str,
+    overlap_iou: float | None = None,
+) -> dict[str, Any]:
+    candidate = {
+        "class_name": proposal.get("class_name"),
+        "score": proposal.get("score"),
+        "bbox": proposal.get("bbox"),
+        "class_id": proposal.get("class_id"),
+        "candidate_status": status,
+        "source": proposal.get("source"),
+    }
+    if overlap_iou is not None:
+        candidate["overlap_iou_with_kept"] = round(float(overlap_iou), 3)
+    if proposal.get("suppression_reason"):
+        candidate["suppression_reason"] = proposal.get("suppression_reason")
+    return candidate
+
+
+def _attach_suppressed_class_candidates(
+    proposals: list[dict[str, Any]],
+    suppressed: list[dict[str, Any]],
+) -> None:
+    for proposal in proposals:
+        candidates = [_class_candidate(proposal, "kept")]
+        for alternative in suppressed:
+            iou = _bbox_iou(proposal.get("bbox", []), alternative.get("bbox", []))
+            if iou <= 0.0:
+                continue
+            candidates.append(_class_candidate(alternative, "suppressed_duplicate", iou))
+        alternatives = sorted(
+            candidates[1:],
+            key=lambda item: (
+                -float(item.get("overlap_iou_with_kept", 0.0) or 0.0),
+                -float(item.get("score", 0.0) or 0.0),
+            ),
+        )
+        proposal["class_candidates"] = [candidates[0], *alternatives]
+        if alternatives:
+            proposal["class_alternatives"] = alternatives
+
+
 def extract_component_proposals_yolo(preprocess_result: dict, config: dict) -> dict:
     """Run YOLO detection and convert boxes into internal proposal objects."""
     detector_cfg = config.get("detector", {})
@@ -141,6 +184,7 @@ def extract_component_proposals_yolo(preprocess_result: dict, config: dict) -> d
 
     duplicate_iou = float(detector_cfg.get("yolo_duplicate_iou", 0.92))
     proposals, suppressed_proposals = _dedupe_overlapping_proposals(proposals, duplicate_iou)
+    _attach_suppressed_class_candidates(proposals, suppressed_proposals)
     return {
         "proposals": proposals,
         "stats": {

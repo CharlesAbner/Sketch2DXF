@@ -66,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="standard",
         help="standard saves compact audit artifacts; full also saves heavy intermediate JSON/images.",
     )
+    parser.add_argument(
+        "--dxf-mode",
+        choices=("clean", "debug"),
+        default=None,
+        help="DXF export style. clean hides internal pin/node labels; debug keeps them.",
+    )
     return parser
 
 
@@ -244,6 +250,8 @@ def main() -> None:
     out_dir = ensure_dir(OUTPUTS_DIR / "debug_runs" / run_name)
     config.setdefault("export", {})
     config["export"]["output_stem"] = run_name
+    if args.dxf_mode is not None:
+        config["export"]["dxf_mode"] = args.dxf_mode
 
     image = load_image(image_path)
     save_image(out_dir / "00_input.png", image)

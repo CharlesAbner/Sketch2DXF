@@ -14,8 +14,15 @@ from __future__ import annotations
 SYMBOL_LIBRARY = {
     "resistor": {"pin_count": 2, "pin_layout": "horizontal_pair"},
     "capacitor": {"pin_count": 2, "pin_layout": "horizontal_pair"},
+    "capacitor.unpolarized": {"pin_count": 2, "pin_layout": "horizontal_pair"},
+    "capacitor.polarized": {"pin_count": 2, "pin_layout": "horizontal_pair"},
+    "power_source": {"pin_count": 2, "pin_layout": "horizontal_pair"},
     "voltage_source": {"pin_count": 2, "pin_layout": "horizontal_pair"},
+    "voltage.battery": {"pin_count": 2, "pin_layout": "horizontal_pair"},
+    "voltage.dc": {"pin_count": 2, "pin_layout": "horizontal_pair"},
+    "voltage.ac": {"pin_count": 2, "pin_layout": "horizontal_pair"},
     "ground": {"pin_count": 1, "pin_layout": "top_single"},
+    "gnd": {"pin_count": 1, "pin_layout": "top_single"},
     "unknown": {"pin_count": 0, "pin_layout": "none"},
 }
 

@@ -12,8 +12,8 @@ from typing import Any
 from src.agent_workflow.llm_client import complete_json
 
 
-EVAL_SCHEMA_VERSION = "3.6-agent-eval-harness"
-SUMMARY_SCHEMA_VERSION = "3.6-agent-eval-summary"
+EVAL_SCHEMA_VERSION = "3.8-agent-eval-harness"
+SUMMARY_SCHEMA_VERSION = "3.8-agent-eval-summary"
 EVAL_REPORT_JSON = "agent_eval_report.json"
 EVAL_REPORT_MD = "agent_eval_report.md"
 EVAL_SUMMARY_JSON = "agent_eval_summary.json"
@@ -33,6 +33,10 @@ Your role:
 - Do not invent node, pin, or component ids.
 - Treat deterministic artifact checks as authoritative for file existence,
   approval, and mutation safety.
+- If repair_effect.status is no_action_expected, review_only_expected,
+  pending_human_approval, approval_not_accepted, or unsupported_apply_type,
+  a missing corrected netlist is expected. Do not treat that as topology loss;
+  judge whether the advisor/apply state is semantically appropriate.
 
 Required JSON keys:
 - semantic_verdict: one of pass, warning, fail, inconclusive
@@ -154,6 +158,7 @@ def _netlist_metrics(netlist: dict[str, Any] | None) -> dict[str, Any]:
         return {
             "exists": False,
             "component_count": 0,
+            "component_signatures": [],
             "pin_count": 0,
             "net_count": 0,
             "single_pin_net_count": 0,
@@ -166,6 +171,14 @@ def _netlist_metrics(netlist: dict[str, Any] | None) -> dict[str, Any]:
         }
 
     components = netlist.get("components", [])
+    component_signatures = [
+        {
+            "component_id": component.get("component_id"),
+            "refdes": component.get("refdes"),
+            "class_name": component.get("class_name"),
+        }
+        for component in components
+    ]
     nets = netlist.get("nets", [])
     pins = []
     missing_pin_net_refs = []
@@ -186,6 +199,7 @@ def _netlist_metrics(netlist: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "exists": True,
         "component_count": len(components),
+        "component_signatures": component_signatures,
         "pin_count": len(pins),
         "net_count": len(nets),
         "single_pin_net_count": len(single_pin_net_ids),
@@ -246,6 +260,121 @@ def _extract_corrected_paths(replay_report: dict[str, Any] | None, apply_dir: Pa
     }
 
 
+def _candidate_pool_from_advisor(advisor_report: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(advisor_report, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    dossier = advisor_report.get("human_review_dossier", {})
+    candidates.extend(dossier.get("selected_candidates", []))
+    for step in advisor_report.get("repair_plan", {}).get("steps", []) or []:
+        if isinstance(step, dict) and isinstance(step.get("candidate"), dict):
+            candidates.append(step["candidate"])
+    for step in dossier.get("repair_plan", {}).get("steps", []) or []:
+        if isinstance(step, dict) and isinstance(step.get("candidate"), dict):
+            candidates.append(step["candidate"])
+    for result in advisor_report.get("tool_results", []):
+        summary = result.get("result_summary", {})
+        candidates.extend(summary.get("top_candidates", []))
+        candidates.extend(summary.get("candidates", []))
+
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or candidate.get("repair_candidate_id") or "")
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        deduped.append(candidate)
+    return deduped
+
+
+def _repair_plan_candidate_ids(advisor_report: dict[str, Any] | None) -> list[str]:
+    if not isinstance(advisor_report, dict):
+        return []
+    return [
+        str(step.get("candidate_id"))
+        for step in advisor_report.get("repair_plan", {}).get("steps", []) or []
+        if isinstance(step, dict) and step.get("candidate_id")
+    ]
+
+
+def _selected_candidates_from_advisor(advisor_report: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(advisor_report, dict):
+        return []
+    selected_ids = set(_repair_plan_candidate_ids(advisor_report))
+    if not selected_ids:
+        return []
+    return [
+        candidate
+        for candidate in _candidate_pool_from_advisor(advisor_report)
+        if str(candidate.get("candidate_id") or candidate.get("repair_candidate_id")) in selected_ids
+    ]
+
+
+def _candidate_is_applyable(candidate: dict[str, Any]) -> bool:
+    return candidate.get("repair_type") in {
+        "merge_nodes",
+        "reattach_pin",
+        "gap_bridge_merge",
+        "single_pin_stub_bridge",
+        "component_pin_axis_flip",
+        "component_class_override",
+    }
+
+
+def _expected_no_replay_status(
+    advisor_report: dict[str, Any] | None,
+    apply_dir: Path | None,
+    apply_report: Path | None,
+) -> str:
+    explicit_apply_requested = bool(apply_dir or apply_report)
+    if explicit_apply_requested:
+        return "missing_apply_unexpected"
+    if not isinstance(advisor_report, dict):
+        return "missing_apply_unexpected"
+
+    decision = str(advisor_report.get("final_decision") or "")
+    selected = _selected_candidates_from_advisor(advisor_report)
+    plan_candidate_ids = _repair_plan_candidate_ids(advisor_report)
+
+    if decision == "no_action":
+        return "no_action_expected"
+    if selected and any(_candidate_is_applyable(candidate) for candidate in selected):
+        return "pending_human_approval"
+    if decision in {
+        "review_only_issue_for_human_review",
+        "needs_more_evidence",
+        "no_candidate_found",
+    }:
+        return "review_only_expected"
+    if plan_candidate_ids:
+        return "review_only_expected"
+    if decision == "candidate_ready_for_human_review":
+        return "review_only_expected"
+    return "review_only_expected"
+
+
+def _normalized_advisor_decision(advisor_report: dict[str, Any] | None) -> str | None:
+    if not isinstance(advisor_report, dict):
+        return None
+    decision = advisor_report.get("final_decision")
+    if decision != "candidate_ready_for_human_review":
+        return decision
+    selected = _selected_candidates_from_advisor(advisor_report)
+    if selected and any(_candidate_is_applyable(candidate) for candidate in selected):
+        return "repair_candidate_ready_for_human_review"
+    return "review_only_issue_for_human_review"
+
+
+def _not_applicable_after_metrics(before: dict[str, Any], status: str) -> dict[str, Any]:
+    return {
+        **before,
+        "not_applicable": True,
+        "reason": status,
+        "baseline_retained": True,
+    }
+
+
 def _agent_behavior(advisor_report: dict[str, Any] | None, replay_report: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(advisor_report, dict):
         return {
@@ -256,10 +385,16 @@ def _agent_behavior(advisor_report: dict[str, Any] | None, replay_report: dict[s
 
     tool_results = advisor_report.get("tool_results", [])
     tool_names = [result.get("tool_name") for result in tool_results]
-    selected_ids = [str(item) for item in advisor_report.get("selected_candidate_ids", [])]
-    candidate_id = None
+    plan_candidate_ids = _repair_plan_candidate_ids(advisor_report)
+    applied_candidate_ids = []
     if isinstance(replay_report, dict):
-        candidate_id = replay_report.get("candidate", {}).get("candidate_id")
+        applied_candidate_ids = [
+            str(item.get("candidate_id"))
+            for item in replay_report.get("applied_candidates", [])
+            if isinstance(item, dict) and item.get("candidate_id")
+        ]
+        if not applied_candidate_ids and replay_report.get("candidate", {}).get("candidate_id"):
+            applied_candidate_ids = [str(replay_report.get("candidate", {}).get("candidate_id"))]
     guardrail_messages = []
     planner = advisor_report.get("planner", {})
     for step in planner.get("planner_steps", []):
@@ -269,13 +404,17 @@ def _agent_behavior(advisor_report: dict[str, Any] | None, replay_report: dict[s
     findings = []
     if advisor_report.get("topology_mutated"):
         findings.append({"severity": "error", "code": "advisor_mutated_topology", "message": "Advisor reported topology mutation."})
-    if not tool_results:
+    final_decision = _normalized_advisor_decision(advisor_report)
+    if not tool_results and final_decision != "no_action":
         findings.append({"severity": "warning", "code": "no_tool_results", "message": "Advisor produced no tool results."})
-    if selected_ids and candidate_id and str(candidate_id) not in selected_ids:
+    missing_from_plan = [
+        candidate_id for candidate_id in applied_candidate_ids if candidate_id not in set(plan_candidate_ids)
+    ]
+    if plan_candidate_ids and missing_from_plan:
         findings.append({
             "severity": "warning",
-            "code": "applied_candidate_not_selected",
-            "message": f"Applied candidate {candidate_id} was not in advisor selected ids {selected_ids}.",
+            "code": "applied_candidate_not_in_plan",
+            "message": f"Applied candidate(s) {missing_from_plan} were not in advisor repair_plan {plan_candidate_ids}.",
         })
     if "repair_dry_run" in tool_names and "get_terminal_attachments" not in tool_names:
         findings.append({
@@ -295,8 +434,9 @@ def _agent_behavior(advisor_report: dict[str, Any] | None, replay_report: dict[s
         "backend": advisor_report.get("backend"),
         "model": advisor_report.get("model"),
         "llm_used": advisor_report.get("llm_used"),
-        "final_decision": advisor_report.get("final_decision"),
-        "selected_candidate_ids": selected_ids,
+        "final_decision": final_decision,
+        "repair_plan": advisor_report.get("repair_plan", {}),
+        "repair_plan_candidate_ids": plan_candidate_ids,
         "tool_result_count": len(tool_results),
         "tool_names": tool_names,
         "guardrail_message_count": len([item for item in guardrail_messages if item]),
@@ -308,49 +448,86 @@ def _agent_behavior(advisor_report: dict[str, Any] | None, replay_report: dict[s
 
 def _repair_effect(
     debug_dir: Path,
+    advisor_report: dict[str, Any] | None,
     replay_report: dict[str, Any] | None,
     original_netlist: dict[str, Any] | None,
     corrected_netlist: dict[str, Any] | None,
     corrected_paths: dict[str, Path | None],
+    apply_dir: Path | None = None,
+    apply_report: Path | None = None,
 ) -> dict[str, Any]:
     before = _netlist_metrics(original_netlist)
-    after = _netlist_metrics(corrected_netlist)
+    raw_status = replay_report.get("status") if isinstance(replay_report, dict) else None
+    status = raw_status or _expected_no_replay_status(advisor_report, apply_dir, apply_report)
+    no_corrected_output_expected = status in {
+        "no_action_expected",
+        "review_only_expected",
+        "pending_human_approval",
+        "approval_not_accepted",
+        "unsupported_apply_type",
+    }
+    after = (
+        _not_applicable_after_metrics(before, status)
+        if no_corrected_output_expected and corrected_netlist is None
+        else _netlist_metrics(corrected_netlist)
+    )
     if isinstance(replay_report, dict):
         before = {**before, **replay_report.get("before_metrics", {})}
-        after = {**after, **replay_report.get("after_metrics", {})}
+        if status == "applied":
+            after = {**after, **replay_report.get("after_metrics", {})}
+        elif corrected_netlist is None:
+            after = _not_applicable_after_metrics(before, status)
 
     dxf_status = _artifact_status(corrected_paths.get("corrected_dxf"))
     export = replay_report.get("export", {}) if isinstance(replay_report, dict) else {}
     export_success = bool(export.get("export_success")) or (dxf_status["exists"] and dxf_status["bytes"] > 0)
     approval_decision = replay_report.get("approval_decision", {}).get("decision") if isinstance(replay_report, dict) else None
-    status = replay_report.get("status") if isinstance(replay_report, dict) else "missing"
+    if no_corrected_output_expected and status != "applied":
+        export_success = None
 
     findings = []
-    if not isinstance(replay_report, dict):
-        findings.append({"severity": "warning", "code": "missing_replay_report", "message": "No repair replay report was found."})
+    if not isinstance(replay_report, dict) and status == "missing_apply_unexpected":
+        findings.append({
+            "severity": "warning",
+            "code": "missing_apply_unexpected",
+            "message": "A repair replay report was expected but not found.",
+        })
+    if status == "unsupported_apply_type":
+        findings.append({
+            "severity": "warning",
+            "code": "unsupported_apply_type",
+            "message": "Selected candidate is review-only and cannot be auto-applied by this apply layer.",
+        })
     if status == "applied" and approval_decision != "accept":
         findings.append({"severity": "error", "code": "applied_without_accept", "message": "Replay status is applied but approval decision is not accept."})
     if isinstance(replay_report, dict) and replay_report.get("topology_mutated_in_place"):
         findings.append({"severity": "error", "code": "topology_mutated_in_place", "message": "Repair mutated original topology in place."})
     if status == "applied" and not export_success:
         findings.append({"severity": "error", "code": "corrected_export_failed", "message": "Corrected DXF export did not succeed."})
-    if before.get("component_count") and after.get("component_count") and before.get("component_count") != after.get("component_count"):
+    compare_after = status == "applied"
+    if compare_after and before.get("component_count") and after.get("component_count") and before.get("component_count") != after.get("component_count"):
         findings.append({"severity": "error", "code": "component_count_changed", "message": "Component count changed after repair."})
-    if before.get("pin_count") and after.get("pin_count") and before.get("pin_count") != after.get("pin_count"):
+    if compare_after and before.get("component_signatures") != after.get("component_signatures"):
+        findings.append({
+            "severity": "error",
+            "code": "component_identity_changed",
+            "message": "Component ids/refdes/classes changed after repair.",
+        })
+    if compare_after and before.get("pin_count") and after.get("pin_count") and before.get("pin_count") != after.get("pin_count"):
         findings.append({"severity": "error", "code": "pin_count_changed", "message": "Pin count changed after repair."})
-    if after.get("zero_pin_net_count", 0) > before.get("zero_pin_net_count", 0):
+    if compare_after and after.get("zero_pin_net_count", 0) > before.get("zero_pin_net_count", 0):
         findings.append({"severity": "error", "code": "zero_pin_regression", "message": "Zero-pin net count increased after repair."})
-    if after.get("single_pin_net_count", 0) > before.get("single_pin_net_count", 0):
+    if compare_after and after.get("single_pin_net_count", 0) > before.get("single_pin_net_count", 0):
         findings.append({"severity": "warning", "code": "single_pin_regression", "message": "Single-pin net count increased after repair."})
     if status == "applied" and after.get("single_pin_net_count", 0) >= before.get("single_pin_net_count", 0):
         findings.append({"severity": "warning", "code": "single_pin_not_improved", "message": "Applied repair did not reduce single-pin nets."})
-    if after.get("same_net_two_pin_components"):
+    if compare_after and after.get("same_net_two_pin_components"):
         findings.append({
             "severity": "warning",
             "code": "two_pin_component_same_net",
             "message": f"Two-pin components have both pins on one net: {after.get('same_net_two_pin_components')}.",
         })
-    if after.get("all_pins_on_one_net"):
+    if compare_after and after.get("all_pins_on_one_net"):
         findings.append({"severity": "error", "code": "all_pins_on_one_net", "message": "All pins are assigned to one net after repair."})
 
     single_pin_delta = _safe_int(before.get("single_pin_net_count")) - _safe_int(after.get("single_pin_net_count"))
@@ -366,10 +543,15 @@ def _repair_effect(
         penalty += 0.4 if finding["severity"] == "error" else 0.15
     if status == "applied" and single_pin_delta > 0:
         penalty -= 0.1
+    if status == "review_only_expected":
+        penalty += 0.05
+    if status == "pending_human_approval":
+        penalty += 0.1
     score = min(1.0, max(0.0, 1.0 - penalty))
     return {
         "debug_dir": str(debug_dir),
         "status": status,
+        "raw_replay_status": raw_status,
         "approval_decision": approval_decision,
         "candidate": replay_report.get("candidate", {}) if isinstance(replay_report, dict) else {},
         "before_metrics": before,
@@ -392,7 +574,7 @@ def _overall_status(findings: list[dict[str, Any]], repair_effect: dict[str, Any
         return "pass_with_warnings"
     if any(item.get("severity") == "warning" for item in findings):
         return "pass_with_warnings"
-    if repair_effect.get("status") != "applied":
+    if repair_effect.get("status") in {"review_only_expected", "pending_human_approval", "unsupported_apply_type"}:
         return "needs_review"
     return "pass"
 
@@ -421,6 +603,21 @@ def _semantic_eval_payload(
     agent_behavior: dict[str, Any],
     repair_effect: dict[str, Any],
 ) -> dict[str, Any]:
+    no_after_expected = repair_effect.get("status") in {
+        "no_action_expected",
+        "review_only_expected",
+        "pending_human_approval",
+        "approval_not_accepted",
+        "unsupported_apply_type",
+    }
+    after_netlist = _compact_netlist(corrected_netlist)
+    if no_after_expected and corrected_netlist is None:
+        after_netlist = {
+            "exists": False,
+            "not_applicable": True,
+            "reason": repair_effect.get("status"),
+            "baseline_retained": _compact_netlist(original_netlist),
+        }
     return {
         "case_id": case_id,
         "deterministic_eval": {
@@ -428,7 +625,7 @@ def _semantic_eval_payload(
                 "workflow_engine": agent_behavior.get("workflow_engine"),
                 "llm_used": agent_behavior.get("llm_used"),
                 "tool_names": agent_behavior.get("tool_names"),
-                "selected_candidate_ids": agent_behavior.get("selected_candidate_ids"),
+                "repair_plan_candidate_ids": agent_behavior.get("repair_plan_candidate_ids"),
                 "findings": agent_behavior.get("findings", []),
             },
             "repair_effect": {
@@ -443,13 +640,13 @@ def _semantic_eval_payload(
             },
         },
         "advisor_review": {
-            "final_decision": advisor_report.get("final_decision") if isinstance(advisor_report, dict) else None,
+            "final_decision": _normalized_advisor_decision(advisor_report),
             "reviewer": advisor_report.get("reviewer", {}) if isinstance(advisor_report, dict) else {},
             "human_review_dossier": advisor_report.get("human_review_dossier", {}) if isinstance(advisor_report, dict) else {},
         },
         "approval": replay_report.get("approval_decision", {}) if isinstance(replay_report, dict) else {},
         "before_netlist": _compact_netlist(original_netlist),
-        "after_netlist": _compact_netlist(corrected_netlist),
+        "after_netlist": after_netlist,
     }
 
 
@@ -556,7 +753,7 @@ def render_eval_report_markdown(report: dict[str, Any]) -> str:
         f"- backend: `{report.get('agent_behavior', {}).get('backend')}`",
         f"- LLM used: `{report.get('agent_behavior', {}).get('llm_used')}`",
         f"- tool names: `{report.get('agent_behavior', {}).get('tool_names')}`",
-        f"- selected candidates: `{report.get('agent_behavior', {}).get('selected_candidate_ids')}`",
+        f"- repair plan candidates: `{report.get('agent_behavior', {}).get('repair_plan_candidate_ids')}`",
         "",
         "## Deterministic Findings",
         "",
@@ -640,7 +837,16 @@ def run_single_case_eval(
     corrected_netlist = corrected_netlist if isinstance(corrected_netlist, dict) else None
 
     agent_behavior = _agent_behavior(advisor_doc, replay_doc)
-    repair_effect = _repair_effect(base_dir, replay_doc, original_netlist, corrected_netlist, corrected_paths)
+    repair_effect = _repair_effect(
+        base_dir,
+        advisor_doc,
+        replay_doc,
+        original_netlist,
+        corrected_netlist,
+        corrected_paths,
+        Path(apply_dir) if apply_dir else None,
+        Path(apply_report) if apply_report else None,
+    )
     semantic_eval = _run_semantic_eval(
         advisor_doc.get("case_id") if isinstance(advisor_doc, dict) else base_dir.name,
         advisor_doc,
@@ -704,6 +910,34 @@ def _case_dirs(cases_dir: Path, pattern: str) -> list[Path]:
     )
 
 
+def _find_existing_case_eval_report(case_path: Path, strategy_name: str) -> tuple[dict[str, Any] | None, Path | None]:
+    reports = [path for path in case_path.rglob(EVAL_REPORT_JSON) if path.is_file()]
+    if not reports:
+        return None, None
+    docs: list[tuple[dict[str, Any], Path]] = []
+    for path in reports:
+        doc = _read_json(path)
+        if isinstance(doc, dict):
+            docs.append((doc, path))
+    if not docs:
+        return None, None
+
+    current_schema = [
+        (doc, path)
+        for doc, path in docs
+        if doc.get("schema_version") == EVAL_SCHEMA_VERSION
+    ]
+    matching_strategy = [
+        (doc, path)
+        for doc, path in current_schema
+        if str(doc.get("strategy_name")) == str(strategy_name)
+    ]
+    if not matching_strategy:
+        return None, None
+    doc, path = max(matching_strategy, key=lambda item: item[1].stat().st_mtime)
+    return doc, path
+
+
 def _status_counts(reports: list[dict[str, Any]]) -> dict[str, int]:
     return dict(Counter(report.get("eval_status") for report in reports))
 
@@ -730,6 +964,8 @@ def render_eval_summary_markdown(summary: dict[str, Any]) -> str:
         f"- repair applied: `{summary.get('repair_applied_count')}`",
         f"- repair improved: `{summary.get('repair_improved_count')}`",
         f"- LLM semantic eval used: `{summary.get('llm_semantic_eval_used_count')}`",
+        f"- summary source: `{summary.get('summary_source')}`",
+        f"- semantic eval source: `{summary.get('semantic_eval_source')}`",
         "",
         "## Cases",
         "",
@@ -778,6 +1014,19 @@ def run_multi_case_eval(
     case_outputs = []
     for case_path in case_paths:
         case_out_dir = out_dir / "cases" / case_path.name
+        existing_report, existing_path = _find_existing_case_eval_report(case_path, strategy_name)
+        if existing_report:
+            case_reports.append(existing_report)
+            md_path = existing_path.with_suffix(".md") if existing_path else None
+            case_outputs.append(
+                {
+                    "eval_report": str(existing_path),
+                    "eval_report_markdown": str(md_path) if md_path and md_path.exists() else None,
+                    "source": "existing_case_eval_report",
+                }
+            )
+            continue
+
         result = run_single_case_eval(
             case_path,
             output_dir=case_out_dir,
@@ -790,7 +1039,7 @@ def run_multi_case_eval(
             write_outputs=True,
         )
         case_reports.append(result["report"])
-        case_outputs.append(result["outputs"])
+        case_outputs.append({**result["outputs"], "source": "generated_by_summary"})
 
     score_keys = ["overall_score", "agent_behavior_score", "repair_effect_score", "semantic_score"]
     score_buckets: dict[str, list[float]] = defaultdict(list)
@@ -842,6 +1091,8 @@ def run_multi_case_eval(
         "repair_applied_count": repair_applied_count,
         "repair_improved_count": repair_improved_count,
         "llm_semantic_eval_used_count": llm_used_count,
+        "summary_source": "existing_case_eval_reports_preferred",
+        "semantic_eval_source": "per_case_reports_when_available",
         "finding_counts": _finding_counts(case_reports),
         "cases": compact_cases,
         "case_outputs": case_outputs,

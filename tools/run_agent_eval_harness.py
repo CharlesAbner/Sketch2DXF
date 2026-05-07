@@ -106,6 +106,8 @@ def main() -> None:
                 "repair_applied_count": summary.get("repair_applied_count"),
                 "repair_improved_count": summary.get("repair_improved_count"),
                 "llm_semantic_eval_used_count": summary.get("llm_semantic_eval_used_count"),
+                "summary_source": summary.get("summary_source"),
+                "semantic_eval_source": summary.get("semantic_eval_source"),
                 "outputs": result["outputs"],
             },
             ensure_ascii=False,
