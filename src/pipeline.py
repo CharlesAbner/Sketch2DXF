@@ -12,8 +12,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from src.agent.audit_agent import generate_audit_report
-from src.agent.explanation_agent import generate_explanation
 from src.export.dxf_exporter import export_to_dxf
 from src.export.overlay_renderer import render_overlay
 from src.io_utils.image_io import load_image
@@ -42,6 +40,29 @@ def _with_export_stem(config: dict, output_stem: str) -> dict:
     runtime_config.setdefault("export", {})
     runtime_config["export"]["output_stem"] = output_stem
     return runtime_config
+
+
+def _build_pipeline_audit_summary(topology: dict, consistency: dict) -> dict:
+    """Return a compact deterministic summary for the non-agent pipeline API."""
+    warnings = consistency.get("warnings", [])
+    return {
+        "summary": "Deterministic pipeline summary.",
+        "topology_component_count": len(topology.get("components", [])),
+        "warning_count": len(warnings),
+        "warnings": warnings,
+    }
+
+
+def _build_pipeline_explanation(topology: dict, audit_report: dict) -> dict:
+    """Return a short deterministic explanation for callers of run_pipeline."""
+    return {
+        "summary": (
+            f"Recovered {len(topology.get('components', []))} components, "
+            f"{len(topology.get('nodes', []))} nodes, and "
+            f"{len(topology.get('connections', []))} connections."
+        ),
+        "audit_summary": audit_report.get("summary"),
+    }
 
 
 def run_pipeline(image_path: str, config: dict) -> dict[str, Any]:
@@ -137,8 +158,8 @@ def run_pipeline(image_path: str, config: dict) -> dict[str, Any]:
         audit_inputs_result,
         repair_candidates_result,
     )
-    audit_result = generate_audit_report(topology_result, consistency_result, runtime_config)
-    explanation_result = generate_explanation(topology_result, audit_result, runtime_config)
+    audit_result = _build_pipeline_audit_summary(topology_result, consistency_result)
+    explanation_result = _build_pipeline_explanation(topology_result, audit_result)
 
     state["preprocess"] = preprocess_result
     state["perception"] = perception_result

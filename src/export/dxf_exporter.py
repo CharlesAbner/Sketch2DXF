@@ -1,7 +1,8 @@
-"""
-本文件的作用：
-- 根据 topology / netlist 结果导出可打开的第一版 DXF。
-- 当前重点是“结果可检查、结构可读”，而不是最终的高质量 schematic 美化。
+"""Export recovered topology/netlist results to editable DXF.
+
+The exporter consumes an in-memory topology object. In clean mode, the layout
+engine may redraw common circuit structures into standardized schematic
+layouts before DXF entities are written.
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
-"""Lightweight DXF layout cleanup for recovered topology.
+"""DXF layout normalization and schematic redraw for recovered topology.
 
-This module does not re-synthesize a schematic from the netlist. It preserves
-the recovered image-space layout, then makes the exported geometry easier to
-read by snapping wire endpoints, snapping to a small grid, filtering unsupported
-wire evidence, and merging collinear wire fragments.
+Clean export mode first tries topology-aware schematic redraw templates
+(ladder, two-rail ladder, and rail/branch layouts). If no template matches,
+it falls back to geometry-preserving cleanup: snapping wire endpoints,
+filtering unsupported wire evidence, and merging collinear fragments.
 """
 
 from __future__ import annotations
