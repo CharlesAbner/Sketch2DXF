@@ -14,6 +14,10 @@ __pycache__/
 # Generated outputs and local agent memory
 outputs/
 
+# Internal handoff / model-context notes are not public project docs.
+PROJECT_HANDOFF*.md
+PROJECT_DETAILED_HANDOFF_*.md
+
 # Local editor / assistant state
 .vscode/
 .claude/

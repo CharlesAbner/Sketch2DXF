@@ -1,299 +1,332 @@
-# Sketch2DXF Agent Workflow
+# Agent Workflow
 
-当前 agent 层的版本语义是 3.7：以 3.4 LangGraph-native repair advisor 为核心，外加 human-approved apply/replay、eval harness 和 failure memory。
-
-它的目标不是让 LLM 直接识别图片，也不是让 LLM 直接修改 `topology.json`。它读取 2.2 主链路产出的结构化 artifacts，然后按需调用安全工具，生成审查结论、dry-run 修复候选、人类可读 dossier、审批后的 corrected artifacts、评估报告和长期 failure memory。
-
-## Position
+本文档描述当前 Sketch2DXF 的 Agent 层。当前版本的 Agent 报告 schema 为：
 
 ```text
-debug artifacts
--> deterministic audit facts
--> LLM/rule planner
--> safe tool calls
--> critic
--> reviewer
--> human review dossier
--> human-approved apply/replay
--> eval harness
--> failure memory
+3.9-hypothesis-tool-agent
 ```
 
-Agent 可以是真实 LLM，也可以是 rule/mock 后端。真实 LLM 用于 planner 和 reviewer；规则后端用于离线验证工作流是否可跑。
+Agent 的定位不是替代视觉/几何主链路，而是在主链路已经输出 topology、netlist、audit 之后，作为“系统大脑”进行问题定位、工具调用、候选验证、human approval 和 replay。
 
-## Inputs
+## 1. 设计原则
 
-对一个已经完成的 debug run，例如：
+Agent 层遵守四个原则：
+
+1. **LLM 不直接改 topology**  
+   LLM 只能提出假设并调用工具。真正的 topology 修改必须由 dry-run candidate 生成，并经过 human approval。
+
+2. **工具是系统能力边界**  
+   LLM 不能凭空创建连接。它必须调用 inspect/dry-run 工具，工具返回结构化证据和候选。
+
+3. **每一步可回放**  
+   Advisor、human dossier、approval decision、corrected topology、replay report、eval report 都落盘。
+
+4. **规则和 LLM 分工明确**  
+   规则负责可计算事实、约束、验证；LLM 负责选择下一步工具、比较假设、组织 repair_plan 与解释。
+
+## 2. 输入与输出
+
+Agent advisor 的输入通常是一个 debug run 目录，例如：
 
 ```text
-outputs/debug_runs/probe_104_baseline
+outputs/debug_runs/agent40_301_plan/
 ```
 
-workflow 会读取：
+它会读取：
 
+- `topology.json`
+- `netlist.json`
 - `case_summary.json`
 - `audit_inputs.json`
 - `repair_candidates.json`
 - `terminal_attachments.json`
+- `evidence_graph.json`
 - `supported_graph.json`
 - `graph_nodes_dry_run.json`
-- `topology.json`
-- `netlist.json`
-- `node_selection.json`
-- `validation.json`
+- 其他可用 debug artifact
 
-缺失 artifact 会被记录为风险，不会让 workflow 直接崩溃。
-
-## Tools
-
-当前暴露给 planner 的工具是有边界的：
-
-- `get_case_summary`: 读 case-level 摘要。
-- `get_single_pin_nets`: 查看单 pin net 和相关 pin/component。
-- `get_terminal_attachments`: 查看 terminal corridor attachment 证据。
-- `get_repair_candidates`: 读确定性 review/repair candidates。
-- `repair_dry_run`: 生成、验证、排序修复候选；只 dry-run，不修改 topology/netlist/DXF。
-
-这些工具都适合 LLM 使用，因为它们输出的是压缩后的结构化事实，不要求 LLM 直接读大图或猜像素。
-
-## Dynamic Tool Loop
-
-3.4 不再固定调用一整套工具。LangGraph 路径中的流程是：
-
-1. `audit_tool`: 加载或生成 agent audit report。
-2. `observe`: 读取紧凑 observation，包括 case summary、audit、artifact presence、available tools。
-3. `plan_next_action`: planner 根据 observation 和已有 tool results 决定下一轮调用 0 到 N 个工具。
-4. `execute_tool`: 执行白名单工具。
-5. `update_state`: 把工具结果写回 agent state。
-6. `decide_continue`: 根据工具结果、stop decision 和预算决定继续规划还是进入审查。
-7. `critic`: 检查工具调用是否越界、是否重复、是否缺少必要证据、是否试图直接改 topology。
-8. `reviewer`: 综合 audit、tool results、critic 输出最终建议。
-9. `human_review_dossier`: 把内部 ID 翻译成人类可检查的 pin/component/evidence/candidate 说明。
-
-每轮最多工具数和最大轮数可配置：
-
-```python
-"agent": {
-    "max_agent_tool_steps": 6,
-    "max_tool_calls_per_step": 3,
-}
-```
-
-命令行覆盖：
-
-```powershell
---max-agent-tool-steps 6 --max-tool-calls-per-step 3
-```
-
-这里的 `3` 不是语义硬编码，只是默认预算。你可以设成 `1` 观察更细的单步决策，也可以设成更大值做批量工具调用。
-
-## LangGraph
-
-`--workflow-engine langgraph` 会使用 LangGraph 的 `StateGraph` 承载节点级循环：
-
-```text
-audit_tool -> observe -> plan_next_action -> execute_tool -> update_state -> decide_continue
-                                             ^                                      |
-                                             |                                      v
-                                             +-------------- repeat ----------------+
--> critic -> reviewer -> END
-```
-
-planner、argument grounding、tool whitelist、dry-run safety 和输出落盘仍由项目代码中的工具函数负责，但循环控制已经暴露为 LangGraph 节点。
-
-如果没有安装 LangGraph，可用：
-
-```powershell
---workflow-engine local
-```
-
-local 版本执行同样语义，只是不经过 LangGraph runtime。
-
-## Commands
-
-规则后端：
-
-```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_advisor.py outputs\debug_runs\probe_104_baseline --backend rule --workflow-engine langgraph
-```
-
-DeepSeek：
-
-```powershell
-$env:DEEPSEEK_API_KEY="your_key"
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_advisor.py outputs\debug_runs\probe_104_baseline --backend deepseek --model deepseek-v4-flash --workflow-engine langgraph
-```
-
-OpenAI-compatible custom provider：
-
-```powershell
-$env:CUSTOM_LLM_API_KEY="your_key"
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_advisor.py outputs\debug_runs\probe_104_baseline --backend custom --base-url https://your-provider.example/v1 --model your-model-name --workflow-engine langgraph
-```
-
-调小每轮工具调用，观察 agent 是否真的按需决策：
-
-```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_advisor.py outputs\debug_runs\probe_104_baseline --backend deepseek --model deepseek-v4-flash --workflow-engine langgraph --max-tool-calls-per-step 1 --max-agent-tool-steps 8
-```
-
-## Outputs
-
-`run_agent_repair_advisor.py` 输出：
+Advisor 输出：
 
 - `agent_repair_advisor_report.json`
 - `agent_repair_advisor_report.md`
 - `agent_human_review_dossier.json`
 - `agent_human_review_dossier.md`
 
-优先读：
+Apply 输出：
 
-- `agent_repair_advisor_report.md`: agent 流程、工具调用、critic、reviewer 结论。
-- `agent_human_review_dossier.md`: 将 `N2 / N4 / MRG1` 等内部 ID 映射到具体 pin/component/evidence。
+- `approval_request.json/.md`
+- `approval_decision.json`
+- `corrected_topology.json`
+- `corrected_netlist.json`
+- `corrected_export.dxf`
+- `repair_replay_report.json/.md`
 
-## Safety Semantics
+Eval 输出：
 
-- Agent 不直接修改 `topology.json`。
-- `repair_dry_run` 不写 corrected topology，只产出 candidate。
-- `accept_for_human_review` 来自确定性 validator/ranker，不是 LLM 单独拍板。
-- LLM reviewer 可以同意、拒绝或要求更多证据，但最终仍是 human review。
-- `run_agent_repair_apply.py` 只有在人工给出 `--approval accept` 或 approval file 后才生成 corrected artifacts。
-- 原始 `topology.json / netlist.json / 14_export.dxf` 不会被覆盖。
-- API key 会被 scrub，不应写入 JSON/Markdown 报告。
+- `agent_eval_report.json/.md`
+- 多 case 时还有 summary json/md。
 
-## Human Approval And Replay
+## 3. 外层 Workflow
 
-Step 2 的闭环是：
-
-```text
-agent advisor
--> approval_request.json/md
--> human accept/reject
--> corrected_topology.json
--> corrected_netlist.json
--> corrected_export.dxf
--> repair_replay_report.json/md
-```
-
-命令：
-
-```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_apply.py outputs\debug_runs\probe_104_baseline --advisor-dir outputs\debug_runs\probe_104_baseline\agent_34_langgraph_deepseek_check --candidate-id MRG1 --approval accept --approved-by Lzk --output-dir outputs\debug_runs\probe_104_baseline\repair_apply_check
-```
-
-当前 apply 支持 `merge_nodes` 候选。后续可以继续扩展 `reattach_pin` 和 evidence-based bridge apply。
-
-## Eval Harness
-
-Step 3 的闭环是：
+如果安装了 LangGraph，可以通过 `--workflow-engine langgraph` 使用 LangGraph `StateGraph` 承载外层节点：
 
 ```text
-agent advisor
--> human-approved repair apply
--> deterministic eval
--> optional LLM semantic eval
--> single-case report / multi-case summary
+audit_tool -> observe -> planner_tool_loop -> critic -> reviewer -> END
 ```
 
-命令：
+其中：
+
+- `audit_tool`：生成或刷新 deterministic/LLM audit。
+- `observe`：构建给 LLM 的事实观察，不把结论喂得过死。
+- `planner_tool_loop`：LLM 多轮选择工具，项目代码执行工具并更新状态。
+- `critic`：规则 guardrail，检查是否还有明显未处理的问题、是否有违规工具调用、是否 dry-run 安全。
+- `reviewer`：LLM 根据全部工具结果生成最终 repair_plan 和解释。
+
+内部 tool loop 没有完全交给 LangGraph 的原因是这里需要严格做：
+
+- 参数 grounding；
+- 工具白名单；
+- dry-run safety；
+- human approval；
+- 本地 artifact 落盘；
+- 兼容无 LangGraph 的 local workflow。
+
+所以 LangGraph 是外层状态机，项目代码负责高安全要求的工具执行细节。
+
+## 4. Planner 如何工作
+
+Planner 每轮会收到：
+
+- 当前 case 摘要；
+- audit 发现；
+- 可用工具 schema；
+- 已完成工具结果；
+- guardrail feedback；
+- memory matches；
+- 允许的最大工具调用次数。
+
+它输出：
+
+- `stop_decision`：`continue` / `final_ready` 等；
+- `tool_calls`：本轮要调用的工具；
+- `hypotheses`：当前假设；
+- `open_questions`：仍未解决的问题；
+- `deferred_questions`：明确延后处理的问题及原因；
+- `planner_notes`：推理摘要。
+
+如果 Planner 带着 open question 提前停止，critic/guardrail 会把它拉回继续调用工具，或要求它给出明确 deferred reason。
+
+## 5. 工具族
+
+### 5.1 Compact Overview Tools
+
+这些工具给 LLM 快速掌握全局：
+
+- `get_case_summary`
+- `get_single_pin_nets`
+- `get_terminal_attachments`
+- `get_repair_candidates`
+- `repair_dry_run`
+
+其中 `repair_dry_run` 是兼容旧流程的聚合工具。当前推荐优先使用更细粒度的 inspect/dry-run 工具。
+
+### 5.2 Inspection Tools
+
+这些工具只观察，不生成可 apply 修改：
+
+- `inspect_component_class_candidates`  
+  查看某个元件的类别候选，例如当前是 capacitor，但候选里有 power_source。
+
+- `inspect_component_terminal_axis`  
+  检查元件当前 terminal axis、候选 axis、pin 位置与 attachment 证据。
+
+- `inspect_single_pin_stub`  
+  检查单 pin net 周围的 supported node、stub pair、距离、方向等。
+
+- `inspect_gap_bridge_candidates`  
+  查看 supported/unsupported evidence 之间的 gap bridge 候选。
+
+- `inspect_single_pin_nets`
+
+- `inspect_terminal_attachments`
+
+### 5.3 Granular Dry-run Tools
+
+这些工具生成候选，但仍然不修改文件：
+
+- `dry_run_merge_nodes`
+- `dry_run_component_class_override`
+- `dry_run_component_axis_flip`
+- `dry_run_reattach_pin`
+- `dry_run_gap_bridge_merge`
+- `dry_run_single_pin_stub_bridge`
+
+dry-run 返回 candidate，包含：
+
+- `candidate_id`
+- `repair_type`
+- `candidate_mode`
+- `validation_result`
+- `ranking_score`
+- `recommendation`
+- `before_metrics`
+- `after_metrics`
+- `improved_metrics`
+- `risk_flags`
+
+### 5.4 Validation
+
+- `validate_candidate`
+
+用于对候选进行额外一致性检查。
+
+## 6. 当前可 Apply 的 Repair Types
+
+当前 apply 层支持：
+
+- `merge_nodes`
+- `reattach_pin`
+- `gap_bridge_merge`
+- `single_pin_stub_bridge`
+- `component_pin_axis_flip`
+- `component_class_override`
+
+这意味着 Agent 不再只是“提出报告”，而是可以在 human approval 后真正 replay 到 topology/netlist/DXF。
+
+## 7. repair_plan 语义
+
+当前语义使用 `repair_plan`，不再以旧字段 `selected_candidate_ids` 作为主语义。
+
+一个 repair_plan 大致长这样：
+
+```json
+{
+  "repair_plan_id": "PLAN1",
+  "status": "pending_human_review",
+  "steps": [
+    {
+      "step_id": "S1",
+      "candidate_id": "AXF1",
+      "repair_type": "component_pin_axis_flip",
+      "depends_on": []
+    },
+    {
+      "step_id": "S2",
+      "candidate_id": "MRG1",
+      "repair_type": "merge_nodes",
+      "depends_on": ["S1"]
+    }
+  ]
+}
+```
+
+这样可以表达多问题 case 的顺序修复，而不是“一次只选一个候选”。
+
+## 8. Human Approval
+
+Advisor 阶段只输出建议。真正修改由 apply 命令完成：
 
 ```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_eval_harness.py --case-dir outputs\debug_runs\probe_104_baseline --advisor-dir outputs\debug_runs\probe_104_baseline\agent_34_langgraph_deepseek_check --apply-dir outputs\debug_runs\probe_104_baseline\repair_apply_check --strategy-name deepseek_v4_pro_apply --llm-backend rule --output-dir outputs\debug_runs\probe_104_baseline\agent_eval_check
+python -B tools\run_agent_repair_apply.py outputs\debug_runs\agent40_301_plan `
+  --advisor-dir outputs\debug_runs\agent40_301_plan\agent_deepseek_check `
+  --approval accept `
+  --approved-by Lzk `
+  --notes "approved repair plan" `
+  --output-dir outputs\debug_runs\agent40_301_plan\repair_deepseek_check
 ```
 
-如果要让 LLM 做整体语义复核：
+Apply 会：
+
+1. 读取 advisor report 和 repair_plan。
+2. 生成 approval request。
+3. 写入 approval decision。
+4. 按计划 replay 候选。
+5. 重新生成 corrected topology/netlist/DXF。
+6. 生成 replay report。
+
+## 9. Eval Harness
+
+Eval harness 当前 schema 为：
+
+```text
+3.8-agent-eval-harness
+3.8-agent-eval-summary
+```
+
+它评估：
+
+- Agent 是否使用了 LLM；
+- 是否调用了合理工具；
+- 是否有 repair_plan；
+- apply/replay 是否存在；
+- repair 前后 topology/netlist 指标是否改善；
+- 可选 LLM semantic eval 是否认为修复语义合理。
+
+## 10. Failure Memory
+
+Failure memory 当前 schema：
+
+```text
+3.7-failure-memory
+```
+
+它记录历史失败模式，例如：
+
+- 某类元件经常发生 axis fallback；
+- 某类图容易产生 single-pin stub；
+- 某种修复经常被人工接受或拒绝。
+
+Memory 不是核心识别依据，而是给 Planner 提供可解释的经验提示。
+
+## 11. 常用命令
+
+运行 Advisor：
 
 ```powershell
 $env:DEEPSEEK_API_KEY="your_key"
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_eval_harness.py --case-dir outputs\debug_runs\probe_104_baseline --advisor-dir outputs\debug_runs\probe_104_baseline\agent_34_langgraph_deepseek_check --apply-dir outputs\debug_runs\probe_104_baseline\repair_apply_check --strategy-name deepseek_v4_pro_apply --llm-backend deepseek --model deepseek-v4-pro --output-dir outputs\debug_runs\probe_104_baseline\agent_eval_deepseek_check
+python -B tools\run_agent_repair_advisor.py outputs\debug_runs\agent40_301_plan `
+  --backend deepseek `
+  --model deepseek-v4-pro `
+  --api-key-env DEEPSEEK_API_KEY `
+  --audit-backend deepseek `
+  --refresh-audit `
+  --workflow-engine langgraph `
+  --max-agent-tool-steps 12 `
+  --max-tool-calls-per-step 1 `
+  --output-dir outputs\debug_runs\agent40_301_plan\agent_deepseek_check
 ```
 
-多 case 汇总：
+Human-approved apply：
 
 ```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_eval_harness.py --cases-dir outputs\debug_runs --pattern "probe_*_baseline" --strategy-name deepseek_v4_pro_apply --llm-backend rule --output-dir outputs\debug_runs\agent_eval_summary_check
+python -B tools\run_agent_repair_apply.py outputs\debug_runs\agent40_301_plan `
+  --advisor-dir outputs\debug_runs\agent40_301_plan\agent_deepseek_check `
+  --approval accept `
+  --approved-by Lzk `
+  --notes "approved repair plan" `
+  --output-dir outputs\debug_runs\agent40_301_plan\repair_deepseek_check
 ```
 
-确定性评估负责：
-
-- advisor 是否真的按工具循环工作。
-- apply 是否经过 human approval。
-- 原始 `topology.json / netlist.json / 14_export.dxf` 是否未被覆盖。
-- 修复前后 `single_pin_net_count / zero_pin_net_count / component_count / pin_count` 是否健康。
-- corrected DXF 是否导出成功。
-
-LLM 语义评估负责：
-
-- 修复后的 netlist 是否更像合理电路。
-- merge 是否可能只是指标变好但语义可疑。
-- 是否存在短路风险、缺失电源/负载、闭合路径不清楚等高层问题。
-- 下一步应该人工看图还是继续查工具。
-
-## Failure Memory
-
-Step 4 把 eval harness 的结论沉淀为长期可读的 failure memory：
-
-```text
-agent_eval_report / agent_eval_summary
--> failure_memory.json/md
--> advisor observation.failure_memory
--> planner/reviewer 使用历史失败模式作为上下文
-```
-
-更新 memory：
+Eval：
 
 ```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_failure_memory.py update --eval-summary outputs\debug_runs\agent_eval_summary_check\agent_eval_summary.json --memory-file outputs\agent_memory\failure_memory.json
+python -B tools\run_agent_eval_harness.py `
+  --case-dir outputs\debug_runs\agent40_301_plan `
+  --advisor-dir outputs\debug_runs\agent40_301_plan\agent_deepseek_check `
+  --apply-dir outputs\debug_runs\agent40_301_plan\repair_deepseek_check `
+  --backend deepseek `
+  --model deepseek-v4-pro `
+  --api-key-env DEEPSEEK_API_KEY `
+  --output-dir outputs\debug_runs\agent40_301_plan\eval_deepseek_check
 ```
 
-查询 memory：
+## 12. 当前边界
 
-```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_failure_memory.py query --memory-file outputs\agent_memory\failure_memory.json --debug-dir outputs\debug_runs\probe_104_baseline
-```
+Agent 层已经具备真实工具调用闭环，但仍有边界：
 
-带 memory 运行 advisor：
+- 它依赖确定性主链路输出的 topology/netlist/evidence。
+- 它不能直接从原图像像素中重新识别结构。
+- 它只能 apply 已实现 repair tool family 覆盖的修改。
+- 多步 repair 已由 `repair_plan` 表达，但复杂图仍需要 human review。
 
-```powershell
-D:\Miniconda\envs\sketch2dxf\python.exe -B tools\run_agent_repair_advisor.py outputs\debug_runs\probe_104_baseline --backend deepseek --model deepseek-v4-pro --workflow-engine langgraph --memory-file outputs\agent_memory\failure_memory.json --memory-limit 5
-```
-
-Memory 只提供上下文，不提供最终判决。它的典型用途是提醒 planner：类似图过去常见问题是单 pin net、错误 merge、DXF 导出失败、短路风险，所以下一轮应优先调用哪些检查工具。
-
-## Agent Eval 3.8 Safety Updates
-
-The eval/apply layer now has stricter consistency semantics:
-
-- `run_agent_repair_apply.py` verifies that the target debug run, `case_summary.json`, and `agent_repair_advisor_report.json` all describe the same case before writing approval or corrected artifacts.
-- Review-only candidates such as `evidence_review` are not auto-applied. If accepted through the apply CLI, they produce `repair_replay_report.json` with `status=unsupported_apply_type` instead of crashing or writing corrected topology.
-- Eval no longer treats a missing replay report as a failed repair by default. It distinguishes `no_action_expected`, `review_only_expected`, `pending_human_approval`, `approval_not_accepted`, `unsupported_apply_type`, and `missing_apply_unexpected`.
-- Missing corrected netlist/DXF is only a failure when a replay was actually expected. For no-action or review-only cases, the baseline topology is explicitly marked as retained.
-- Eval checks component identity, not just component count. A repaired netlist that changes component id/refdes/class now raises `component_identity_changed`.
-- Multi-case summary prefers existing per-case eval reports only when they use the current eval schema and the same `strategy_name`; otherwise it regenerates that case eval.
-
-Reviewer decisions use these normalized labels:
-
-- `repair_candidate_ready_for_human_review`: an apply-able repair candidate, currently `merge_nodes`, is ready for human confirmation.
-- `review_only_issue_for_human_review`: evidence or low-confidence issues should be inspected, but no automatic topology correction is selected.
-- `needs_more_evidence`: tool results are insufficient or inconclusive.
-- `no_candidate_found`: repair dry-run ran but produced no actionable candidate.
-- `no_action`: no further action is recommended.
-
-## What Agent Adds
-
-当前 agent 真正负责：
-
-- 判断下一步该看哪些工具结果。
-- 根据工具结果决定是否继续查证。
-- 把多个 artifacts 中的 evidence 串起来。
-- 对 dry-run candidate 做自然语言解释。
-- 输出人类可审核的 dossier。
-- 在 Step 3 中对 advisor/apply 结果做评估，并可选调用 LLM 进行整体语义复核。
-- 在 Step 4 中从 eval 结果沉淀 failure memory，并把相关历史模式注入下一次 advisor observation。
-
-它还没有做到：
-
-- 多策略重跑 pipeline。
-- 主动生成新的反例测试。
-
-这些是后续 4.0 的优化方向。
+这是一种更适合严谨工程场景的 Agent 设计：LLM 负责策略，工具负责事实与执行，人的批准负责最终结构变更。

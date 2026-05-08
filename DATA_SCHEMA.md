@@ -1,524 +1,397 @@
-# Sketch2DXF Data Schema
+# Data Schema
 
-This document describes the current runtime artifacts. Historical schema
-version strings such as `3.0-agent-audit` and `3.1-step5-repair-dry-run` are
-kept for backward compatibility. The current agent suite is 3.7: it keeps the
-3.4 LangGraph-native advisor schema, then adds human-approved apply/replay,
-eval harness, failure memory, and polished DXF export artifacts.
+本文档说明 Sketch2DXF 当前主要 JSON artifact 的语义。它不是逐字段 API 规范，而是用于理解 pipeline、debug、Agent 和 eval 输出之间的关系。
 
-## 1. Project State
+当前主线：
 
-Source: `src/state.py`, `src/pipeline.py`
-
-```python
-{
-    "input": {...},
-    "preprocess": {...},
-    "perception": {...},
-    "topology": {...},
-    "validation": {...},
-    "export": {...},
-}
+```text
+image -> proposals -> terminals -> wire evidence
+      -> evidence_graph -> terminal_attachments
+      -> supported_graph -> graph_nodes_dry_run
+      -> topology/netlist -> audit/case_summary
+      -> agent advisor -> repair_plan -> human-approved apply
+      -> corrected topology/netlist/DXF -> eval
 ```
 
-`run_pipeline()` returns this state. The formal visual/debug artifacts are
-written by `debug_run.py`.
+## 1. proposals.json
 
-## 2. Wire Evidence
+元件检测输出。每个 proposal 通常包含：
 
-Source: `src/perception/wire_extract.py`
+- `component_id`
+- `class_name`
+- `bbox`
+- `confidence`
+- `class_candidates`
+- `source`
 
-`wire_evidence.json` contains:
+`class_candidates` 对 Agent 很重要。例如 005 中当前类别是 capacitor，但候选里存在 power_source，Agent 可以据此提出 `component_class_override`。
 
-- `raw_segments`: raw Hough / extracted line evidence.
-- `filtered_segments`: evidence after local cleanup.
-- `segments`: current evidence segments consumed by later graph logic.
-- `stats`: segment counts and orientation counts.
+## 2. pins / terminals
 
-Wire evidence is not final truth. It is only the geometry evidence layer.
+Terminal 通常由 bbox、元件类别、axis、周围导线 evidence 综合生成。重要字段包括：
 
-## 3. Evidence Graph
+- `pin_id`
+- `component_id`
+- `x`, `y`
+- `side`
+- `axis`
+- `confidence`
 
-Source: `src/topology/evidence_graph.py`
+Terminal 是拓扑恢复的锚点，不是单纯依赖像素检测得到的端点。
 
-`evidence_graph.json` organizes wire segments, endpoints, junctions, inferred
-intersections, raw connected components, and bridge candidates.
+## 3. wire.json
 
-Important concepts:
+导线提取结果现在被视为 evidence，而不是最终真相。
 
-- `vertices`: endpoints, detected junctions, inferred intersections.
-- `edges`: segment edges and touch/intersection links.
-- `raw_components`: connected evidence components before terminal support.
-- `bridge_candidates`: possible gaps or connector candidates.
+典型字段：
 
-## 4. Terminal Attachments
+- `segments`
+- `orientation`
+- `x1`, `y1`, `x2`, `y2`
+- `source`
+- `keep_reasons`
+- `noise_flags`
 
-Source: `src/topology/terminal_attachment.py`
+导线提取失败不一定直接导致 topology 失败，因为后续还有 terminal attachment、supported graph 和 Agent repair。
 
-`terminal_attachments.json` answers:
+## 4. junctions.json
 
-> For each terminal hypothesis, what evidence can it see along its terminal
-> corridor/ray?
+描述线段端点、交点和 junction candidates：
 
-Key fields:
+- `endpoints`
+- `junctions`
+- `segment_refs`
 
-- `attachments`: best attachment per pin.
-- `candidates_by_pin`: all candidate attachments.
-- `best_raw_component_id`
-- `best_evidence_kind`
-- `best_evidence_id`
-- `best_attachment_score`
+它属于连接证据层。
 
-## 5. Supported Graph
+## 5. evidence_graph.json
 
-Source: `src/topology/supported_graph.py`
+Evidence graph 是 2.0 之后的核心中间层。它把线段、端点、junction 组成 raw connected components。
 
-`supported_graph.json` marks which raw evidence components are supported by
-terminal attachments.
+常见结构：
 
-Common support states:
+- `raw_components`
+- `segments`
+- `points`
+- `component_ids`
+- `support_status`
+- `candidate_bridge_links`
+- `unsupported_components`
 
-- `best_terminal_supported`
-- `candidate_terminal_supported`
-- `relay_supported`
-- `unsupported`
+它回答的问题是：
 
-`relay_supported` means the raw component is kept because it bridges supported
-components, even if no terminal directly attaches to it.
+> 纯几何证据可以连成哪些 raw graph component？
 
-## 6. Graph Nodes Dry Run
+但 raw component 不等于 electrical node。
 
-Source: `src/topology/graph_node_dry_run.py`
+## 6. terminal_attachments.json
 
-`graph_nodes_dry_run.json` builds candidate electrical nodes from the supported
-graph and compares them with legacy node-builder output.
+Terminal attachment 描述每个 pin 能看到哪些 nearby evidence。
 
-Key fields:
+常见字段：
+
+- `pin_id`
+- `component_id`
+- `raw_component_id`
+- `segment_id`
+- `projected_point`
+- `distance`
+- `alignment_score`
+- `attachment_score`
+- `axis`
+
+它回答的问题是：
+
+> terminal 作为锚点，附近有哪些可能的连接证据？
+
+Agent 的 `inspect_component_terminal_axis`、`inspect_single_pin_stub` 等工具会消费这些信息。
+
+## 7. supported_graph.json
+
+Supported graph 将 raw evidence 按 terminal 支持、relay support、gap bridge 等规则筛选。
+
+常见字段：
+
+- `supported_components`
+- `unsupported_components`
+- `support_reasons`
+- `terminal_support`
+- `relay_support`
+- `bridge_candidates`
+
+它回答的问题是：
+
+> 哪些 evidence 更像真实电路连接，哪些更像噪声或未解决证据？
+
+## 8. graph_nodes_dry_run.json
+
+Graph-derived nodes 的 dry-run 结果。它不会直接强制覆盖 legacy node，而是与 legacy 结果比较，由 node selection 选择。
+
+常见字段：
 
 - `graph_nodes`
-- `discarded_raw_components`
-- `used_bridge_candidates`
-- `node_diff`
-
-## 7. Node Selection
-
-Source: `src/topology/graph_node_selector.py`
-
-`node_selection.json` records whether the final topology used graph-derived
-nodes or legacy fallback.
-
-```python
-{
-    "selected_node_source": "graph_derived" | "legacy",
-    "fallback_used": bool,
-    "fallback_reasons": list[str],
-    "graph_node_count": int,
-    "legacy_match_count": int,
-    "graph_match_count": int,
-    "node_diff_stats": dict,
-}
-```
-
-The current expected path is `selected_node_source = graph_derived` with
-`fallback_used = false`. Legacy fallback is still kept as a safety mechanism.
-
-## 8. Final Nodes
-
-Source: `src/topology/graph_node_selector.py`, `src/topology/node_builder.py`
-
-`nodes.json` is the selected final node result.
-
-Important fields:
-
-- `nodes`: active electrical nodes.
-- `raw_nodes`: raw/legacy node data retained for debug.
-- `discarded_nodes`: unsupported or filtered candidates.
-- `stats`: selected node source, support counts, fallback state.
-
-## 9. Topology And Netlist
-
-Source: `src/topology/topology_builder.py`
-
-`topology.json` contains components, pins, nodes, pin-node connections, nets,
-component-net mapping, and compact netlist data.
-
-`netlist.json` contains a simplified editable netlist:
-
-- `components`: component refs/classes/pins/net ids.
-- `nets`: net id, pin count, pin refs, component refs.
-
-## 10. Audit Inputs
-
-Source: `src/topology/audit_inputs.py`
-
-`audit_inputs.json` is the structured input shared by human review and agent
-workflows.
-
-It includes:
-
-- quality summary
-- component/pin/node/net summaries
-- evidence summary
-- node selection details
-- validation and export status
-- risk flags
-
-Common risk flag codes:
-
-- `low_confidence_match`
-- `weak_confidence_match`
-- `unsupported_evidence`
-- `relay_supported_node`
+- `legacy_nodes`
+- `comparison`
+- `selected_node_source`
 - `fallback_used`
-- `graph_legacy_diff`
-- `unmatched_pin`
-- `isolated_net`
-- `export_failed`
+- `fallback_reason`
 
-## 11. Repair Candidates
+如果 graph-derived 质量不足，系统可能回退到 legacy nodes。
 
-Source: `src/topology/repair_candidates.py`
+## 9. node_selection.json
 
-`repair_candidates.json` is deterministic and non-mutating. It points out
-reviewable risks before the agent workflow runs.
+记录最终选择 graph-derived 还是 legacy result。
 
-Common issue types:
+关键字段：
 
-- `unmatched_pin`
-- `low_confidence_pin_match`
-- `weak_confidence_pin_match`
-- `ambiguous_terminal_attachment`
-- `unsupported_evidence_review`
-- `possible_gap_bridge`
-- `relay_node_review`
-- `fallback_used_review`
-- `graph_legacy_diff_review`
-- `consistency_warning_review`
-- `consistency_error_review`
+- `selected_node_source`
+- `fallback_used`
+- `fallback_reason`
+- `comparison_metrics`
 
-## 12. Case Summary
+这对答辩很重要：系统不是盲目使用新图算法，而是有可解释 fallback。
 
-Source: `src/topology/case_summary.py`
+## 10. topology.json
 
-`case_summary.json` is the compact single-case review entry point. It combines
-`audit_inputs.json` and `repair_candidates.json`.
+Topology 是主链路的结构化输出，描述：
 
-Important fields:
+- `components`
+- `pins`
+- `nodes`
+- `connections`
+- `nets`
+- `metadata`
+- `repair_history`（如果来自 corrected topology）
 
-- `review_status`: `pass`, `needs_review`, or `fail`.
-- `agent_ready`: whether the artifacts are sufficient for agent review.
-- `summary`: compact counts and quality flags.
-- `issue_overview`: risk and repair type counts.
-- `review_focus`: short lists for humans and agents.
-- `artifacts`: paths to key outputs.
+它是 DXF 导出的主要输入。
 
-## 13. Regression Report
+## 11. netlist.json
 
-Source: `run_regression.py`
+Netlist 更偏电路关系，常见字段：
 
-`regression_report.json` records expected-case checks over fixed samples:
+- `components`
+- `nets`
+- `connections`
+- `pins`
 
-- graph-derived nodes selected
-- no fallback
-- export success
-- acceptable consistency score
-- no error-level risk
-- no topology mutation by repair candidates
+它适合做审计，例如：
 
-## 14. Standalone Agent Audit
+- 是否存在 zero-pin net；
+- 是否存在 single-pin net；
+- 是否所有 pin 都在同一个 net；
+- 两端元件是否短接到同一个 net。
 
-Source: `tools/run_agent_audit.py`, `src/agent_workflow/workflow.py`
+## 12. case_summary.json
 
-`agent_audit_report.json` is a standalone audit artifact used directly by the
-3.4 advisor. Its schema string remains `3.0-agent-audit` for compatibility.
+Case summary 是面向人和 Agent 的紧凑摘要。
 
-It contains:
+常见字段：
 
-- deterministic facts
-- topology semantic audit
-- stage diagnoses
-- evidence list
-- recommended actions
-- optional LLM assessment
+- `review_status`
+- `agent_ready`
+- `summary`
+- `issue_overview`
+- `review_focus`
+- `artifacts`
 
-This audit is read-only.
+它把 topology、netlist、audit、repair_candidates 等信息压缩成一个入口。
 
-## 15. Repair Dry Run
+## 13. repair_candidates.json
 
-Source: `tools/run_agent_repair_dry_run.py`,
-`src/agent_workflow/repair_dry_run.py`
+确定性审计生成的候选问题和初步候选，不等同于 Agent 最终 repair_plan。
 
-`agent_repair_dry_run.json` generates validated and ranked candidate repairs
-without mutating `topology.json`, `netlist.json`, or DXF.
+常见字段：
 
-Supported dry-run tools:
+- `repair_candidate_id`
+- `issue_type`
+- `severity`
+- `recommended_action`
+- `refs`
+- `candidate_mode`
 
-- `merge_nodes_dry_run`
-- `reattach_pin_dry_run`
-- `evidence_review_dry_run`
+当前 Agent 会把它作为观察材料之一，但不会被它完全绑定。
 
-Candidate ranking may recommend `accept_for_human_review`, but this only means
-the candidate is suitable for human approval. It is not an automatic repair.
+## 14. Agent Advisor Report
 
-## 16. Agent 3.4 Repair Advisor
+当前 schema：
 
-Source: `tools/run_agent_repair_advisor.py`,
-`src/agent_workflow/repair_advisor.py`
-
-`agent_repair_advisor_report.json` is the current recommended agent output.
-
-Schema:
-
-```python
-{
-    "schema_version": "3.4-langgraph-native-tool-state-machine",
-    "workflow_engine": "local" | "langgraph",
-    "backend": "rule" | "mock" | "openai" | "deepseek" | "custom",
-    "agent_loop_config": {
-        "max_agent_tool_steps": int,
-        "max_tool_calls_per_step": int,
-    },
-    "workflow_mode": "local_loop" | "langgraph_native_state_machine",
-    "workflow_topology": list[str],
-    "available_tools": list[dict],
-    "planner": dict,
-    "tool_results": list[dict],
-    "critic": dict,
-    "reviewer": dict,
-    "human_review_dossier": dict,
-    "final_decision": str,
-    "selected_candidate_ids": list[str],
-    "topology_mutated": False,
-}
+```text
+3.9-hypothesis-tool-agent
 ```
 
-Current safe tools:
+主要结构：
 
-- `get_case_summary`
-- `get_single_pin_nets`
-- `get_terminal_attachments`
-- `get_repair_candidates`
-- `repair_dry_run`
+- `summary`
+- `agent_trace`
+- `planner`
+- `tool_results`
+- `critic`
+- `reviewer`
+- `repair_plan`
+- `outputs`
 
-Companion outputs:
+核心语义是 `repair_plan`，而不是旧版本的 `selected_candidate_ids`。
 
-- `agent_repair_advisor_report.md`
-- `agent_human_review_dossier.json`
-- `agent_human_review_dossier.md`
+## 15. Tool Results
 
-The dossier is the human-readable bridge from internal IDs such as `N2`, `N4`,
-and `MRG1` to actual pins, components, evidence IDs, and candidate rationale.
+每个工具结果至少包含：
 
-## 17. Human-Approved Repair Apply
+- `tool_call_id`
+- `tool_name`
+- `status`
+- `arguments`
+- `grounded_args`
+- `summary`
+- `candidates` 或 inspection-specific payload
 
-Source: `tools/run_agent_repair_apply.py`,
-`src/agent_workflow/repair_apply.py`
+Inspection tool 只返回事实。Dry-run tool 返回候选。
 
-This stage converts an accepted dry-run candidate into corrected artifacts
-without overwriting original debug outputs.
+## 16. Granular Dry-run Candidate
 
-Approval request:
+当前 granular dry-run schema：
 
-```python
-{
-    "schema_version": "3.5-human-approval-request",
-    "request_status": "pending_human_decision",
-    "candidate": {
-        "candidate_id": str,
-        "repair_type": str,
-        "target_nodes": list[str],
-        "target_pins": list[str],
-        "recommendation": str,
-        "validation_result": str,
-    },
-}
+```text
+3.9-granular-repair-dry-run
 ```
 
-Replay report:
+候选字段通常包括：
 
-```python
-{
-    "schema_version": "3.5-human-approved-repair-apply",
-    "status": "approval_not_accepted" | "applied",
-    "approval_decision": dict,
-    "candidate": dict,
-    "before_metrics": dict,
-    "after_metrics": dict,
-    "topology_mutated_in_place": False,
-    "export": dict,
-    "outputs": {
-        "corrected_topology": "corrected_topology.json",
-        "corrected_netlist": "corrected_netlist.json",
-        "corrected_dxf": "corrected_export.dxf",
-    },
-}
-```
+- `candidate_id`
+- `repair_type`
+- `candidate_mode`
+- `validation_result`
+- `recommendation`
+- `ranking_score`
+- `before_metrics`
+- `after_metrics`
+- `improved_metrics`
+- `risk_flags`
+- `target_nodes`
+- `target_pins`
 
-Current apply support:
+当前可 dry-run/apply 的 repair types：
 
 - `merge_nodes`
+- `reattach_pin`
+- `gap_bridge_merge`
+- `single_pin_stub_bridge`
+- `component_pin_axis_flip`
+- `component_class_override`
 
-Original `topology.json`, `netlist.json`, and `14_export.dxf` remain unchanged.
+## 17. repair_plan
 
-## 18. Agent Eval Harness
+当前 Agent 最终建议使用 repair_plan 表达：
 
-Source: `tools/run_agent_eval_harness.py`,
-`src/agent_workflow/eval_harness.py`
-
-`agent_eval_report.json` evaluates one advisor/apply run. It combines
-deterministic safety metrics with an optional LLM semantic review.
-
-Single-case report:
-
-```python
+```json
 {
-    "schema_version": "3.6-agent-eval-harness",
-    "case_id": str,
-    "strategy_name": str,
-    "eval_status": "pass" | "pass_with_warnings" | "needs_review" | "fail",
-    "scores": {
-        "agent_behavior_score": float,
-        "repair_effect_score": float,
-        "semantic_score": float | None,
-        "overall_score": float,
-    },
-    "agent_behavior": {
-        "workflow_engine": str,
-        "workflow_mode": str,
-        "backend": str,
-        "llm_used": bool,
-        "tool_names": list[str],
-        "selected_candidate_ids": list[str],
-    },
-    "repair_effect": {
-        "status": str,
-        "approval_decision": str,
-        "candidate": dict,
-        "before_metrics": dict,
-        "after_metrics": dict,
-        "improvement": dict,
-        "export_success": bool,
-    },
-    "semantic_eval": {
-        "used": bool,
-        "backend": str,
-        "semantic_verdict": "pass" | "warning" | "fail" | "inconclusive" | "not_run",
-        "semantic_score": float | None,
-        "summary": str | None,
-        "risks": list[str],
-        "next_checks": list[str],
-    },
-    "deterministic_findings": list[dict],
-    "artifacts": dict,
-}
-```
-
-Companion output:
-
-- `agent_eval_report.md`
-
-`agent_eval_summary.json` aggregates many case reports for strategy comparison.
-
-Batch summary:
-
-```python
-{
-    "schema_version": "3.6-agent-eval-summary",
-    "strategy_name": str,
-    "cases_dir": str,
-    "pattern": str,
-    "total_cases": int,
-    "status_counts": dict,
-    "average_scores": dict,
-    "repair_applied_count": int,
-    "repair_improved_count": int,
-    "llm_semantic_eval_used_count": int,
-    "finding_counts": dict,
-    "cases": list[dict],
-}
-```
-
-Companion output:
-
-- `agent_eval_summary.md`
-
-The deterministic portion checks artifact presence, human approval safety,
-before/after topology metrics, single-pin/zero-pin regressions, component/pin
-stability, and corrected DXF export. The optional LLM semantic evaluator only
-reviews compact structured artifacts; it does not inspect images or mutate
-topology.
-
-## 19. Failure Memory
-
-Source: `tools/run_agent_failure_memory.py`,
-`src/agent_workflow/failure_memory.py`
-
-`failure_memory.json` stores recurring failure patterns extracted from
-`agent_eval_report.json` or `agent_eval_summary.json`.
-
-```python
-{
-    "schema_version": "3.7-failure-memory",
-    "created_at": str,
-    "updated_at": str,
-    "pattern_count": int,
-    "patterns": [
-        {
-            "pattern_id": str,
-            "kind": "deterministic" | "semantic" | "eval_status",
-            "code": str,
-            "count": int,
-            "severity_counts": dict,
-            "cases": list[dict],
-            "last_message": str,
-            "suggested_actions": list[str],
-            "example_case": dict,
-        }
-    ],
-    "case_index": dict,
-}
-```
-
-Companion output:
-
-- `failure_memory.md`
-
-Advisor integration:
-
-```python
-{
-    "observation": {
-        "failure_memory": {
-            "exists": bool,
-            "path": str,
-            "pattern_count": int,
-            "case_signals": list[str],
-            "matched_pattern_count": int,
-            "matched_patterns": list[dict],
-        }
+  "repair_plan_id": "PLAN1",
+  "status": "pending_human_review",
+  "steps": [
+    {
+      "step_id": "S1",
+      "candidate_id": "AXF1",
+      "repair_type": "component_pin_axis_flip",
+      "depends_on": []
     }
+  ]
 }
 ```
 
-Memory is contextual. It can influence tool planning, but it is not a proof of
-the current case and cannot approve or apply repairs.
+多问题 case 可以有多个 step，并通过 `depends_on` 表达顺序。
 
-## 20. Polished DXF Export
+## 18. Human Review Dossier
 
-Source: `src/export/dxf_exporter.py`
+给人看的审阅材料，通常包括：
 
-The DXF exporter writes a readable schematic-style file while preserving the
-recovered relative geometry. Current layers:
+- final decision；
+- repair_plan；
+- candidate groups；
+- confidence cues；
+- human checklist；
+- net/component/pin 解释。
 
-- `WIRES`
-- `COMPONENTS`
-- `LABELS`
-- `NETS`
-- `PINS`
-- `NODES`
-- `TITLE`
-- `REPAIR`
+它的目标是让人不需要在一堆 JSON 中盲找 N1、N2、cp_3_p1。
 
-Human-approved corrected topologies may include `repair_history` and
-`human_approval`; these are rendered in the `REPAIR` layer so the corrected DXF
-can be traced back to the approved candidate.
+## 19. Apply / Replay Report
+
+当前 apply schema：
+
+```text
+3.5-human-approved-repair-apply
+```
+
+Apply 输出：
+
+- `approval_request`
+- `approval_decision`
+- `corrected_topology`
+- `corrected_netlist`
+- `corrected_dxf`
+- `replay_report`
+
+Replay report 记录：
+
+- 哪些 candidate 被执行；
+- topology 是否修改；
+- netlist 指标如何变化；
+- DXF 是否成功导出；
+- 是否有风险或失败。
+
+## 20. Agent Eval
+
+当前 eval schema：
+
+```text
+3.8-agent-eval-harness
+3.8-agent-eval-summary
+```
+
+Eval 评估：
+
+- Agent 是否使用 LLM；
+- 是否调用工具；
+- 是否生成 repair_plan；
+- 是否经过 apply/replay；
+- before/after topology 是否改善；
+- 可选 LLM semantic eval 是否通过。
+
+## 21. Failure Memory
+
+当前 memory schema：
+
+```text
+3.7-failure-memory
+```
+
+它记录历史失败模式，给后续 Agent planner 提供参考，不作为硬规则直接修改 topology。
+
+## 22. DXF Export
+
+DXF 导出读取 topology/corrected topology，不读取原始图像来描线。
+
+当前 clean 模式包含：
+
+- common schematic redraw；
+- RC ladder redraw；
+- two-rail ladder redraw；
+- mesh-like graph redraw；
+- geometry-preserving fallback。
+
+这让 DXF 更像标准电路图，而不是手绘线条的矢量化噪声。
+
+## 23. 兼容旧字段
+
+项目中仍保留少量旧 schema 或旧字段用于兼容历史输出，例如：
+
+- old bulk `repair_dry_run`
+- older eval/advisor artifacts
+- legacy node fallback
+
+但当前文档和新输出应以以下语义为准：
+
+- Advisor：`3.9-hypothesis-tool-agent`
+- Dry-run：granular tools + `3.9-granular-repair-dry-run`
+- Repair selection：`repair_plan`
+- Apply：`3.5-human-approved-repair-apply`
+- Eval：`3.8-agent-eval-harness`
+- Memory：`3.7-failure-memory`
