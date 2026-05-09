@@ -18,7 +18,6 @@ import numpy as np
 from generate_handdrawn_tests import (
     connect_path,
     draw_capacitor,
-    draw_hand_line,
     draw_label,
     draw_resistor,
     draw_source,
@@ -191,102 +190,10 @@ def case_303_mixed_parallel_filter_bank(rng: random.Random) -> tuple[np.ndarray,
     )
 
 
-def case_304_dual_loop_multi_shunt(rng: random.Random) -> tuple[np.ndarray, dict]:
-    image = paper_background(rng)
-    comps = [
-        draw_source(image, (120, 405), rng, "B1", "v"),
-        draw_resistor(image, (355, 160), rng, "R1", "h", "zigzag"),
-        draw_resistor(image, (685, 160), rng, "R2", "h", "box"),
-        draw_resistor(image, (1010, 405), rng, "R3", "v", "box"),
-        draw_capacitor(image, (685, 640), rng, "C1", "h"),
-        draw_resistor(image, (355, 405), rng, "R4", "v", "box"),
-        draw_capacitor(image, (565, 405), rng, "C2", "v"),
-        draw_resistor(image, (850, 405), rng, "R5", "v", "zigzag"),
-    ]
-
-    connect_path(image, [(120, 321), (120, 160), (281, 160)], rng)
-    connect_path(image, [(429, 160), (611, 160)], rng)
-    connect_path(image, [(759, 160), (1010, 160), (1010, 331)], rng)
-    connect_path(image, [(1010, 479), (1010, 640), (759, 640)], rng)
-    connect_path(image, [(611, 640), (120, 640), (120, 489)], rng)
-    connect_path(image, [(355, 160), (355, 331)], rng)
-    connect_path(image, [(355, 479), (355, 640)], rng)
-    connect_path(image, [(565, 160), (565, 331)], rng)
-    connect_path(image, [(565, 479), (565, 640)], rng)
-    connect_path(image, [(850, 160), (850, 331)], rng)
-    connect_path(image, [(850, 479), (850, 640)], rng)
-    for point in [(355, 160), (565, 160), (850, 160), (355, 640), (565, 640), (850, 640)]:
-        draw_node_dot(image, point)
-    draw_label(image, "dual loop + shunts", (425, 96), rng, 0.75)
-
-    return finish_image(image, rng), metadata(
-        case_id="304_dual_loop_multi_shunt",
-        difficulty="advanced",
-        stressors=["dual_loop", "three_shunt_branches", "eight_components", "dense_t_junctions"],
-        expected_components=comps,
-        expected_nets=[
-            ["B1.p1", "R1.p1", "R4.p1"],
-            ["R1.p2", "R2.p1", "C2.p1"],
-            ["R2.p2", "R3.p1", "R5.p1"],
-            ["B1.p2", "R4.p2", "C2.p2", "C1.p1"],
-            ["R3.p2", "R5.p2", "C1.p2"],
-        ],
-    )
-
-
-def case_305_dense_supported_grid(rng: random.Random) -> tuple[np.ndarray, dict]:
-    image = paper_background(rng)
-    comps = [
-        draw_source(image, (115, 410), rng, "B1", "v"),
-        draw_resistor(image, (300, 155), rng, "R1", "h", "box"),
-        draw_resistor(image, (555, 155), rng, "R2", "h", "zigzag"),
-        draw_resistor(image, (810, 155), rng, "R3", "h", "box"),
-        draw_capacitor(image, (430, 410), rng, "C1", "v"),
-        draw_resistor(image, (685, 410), rng, "R4", "v", "box"),
-        draw_capacitor(image, (940, 410), rng, "C2", "v"),
-        draw_resistor(image, (555, 665), rng, "R5", "h", "box"),
-        draw_capacitor(image, (940, 665), rng, "C3", "h"),
-    ]
-
-    connect_path(image, [(115, 326), (115, 155), (226, 155)], rng)
-    connect_path(image, [(374, 155), (481, 155)], rng)
-    connect_path(image, [(629, 155), (736, 155)], rng)
-    connect_path(image, [(884, 155), (1040, 155), (1040, 410), (940, 410)], rng)
-    connect_path(image, [(115, 494), (115, 665), (481, 665)], rng)
-    connect_path(image, [(629, 665), (866, 665)], rng)
-    connect_path(image, [(1014, 665), (1040, 665), (1040, 410)], rng)
-    connect_path(image, [(430, 155), (430, 336)], rng)
-    connect_path(image, [(430, 484), (430, 665)], rng)
-    connect_path(image, [(685, 155), (685, 336)], rng)
-    connect_path(image, [(685, 484), (685, 665)], rng)
-    connect_path(image, [(940, 155), (940, 336)], rng)
-    connect_path(image, [(940, 484), (940, 665)], rng)
-    for point in [(430, 155), (685, 155), (940, 155), (430, 665), (685, 665), (940, 665)]:
-        draw_node_dot(image, point)
-    draw_label(image, "dense grid", (520, 94), rng, 0.75)
-
-    return finish_image(image, rng), metadata(
-        case_id="305_dense_supported_grid",
-        difficulty="advanced_plus",
-        stressors=["nine_components", "dense_supported_grid", "multiple_bus_taps", "mixed_rc"],
-        expected_components=comps,
-        expected_nets=[
-            ["B1.p1", "R1.p1"],
-            ["R1.p2", "R2.p1", "C1.p1"],
-            ["R2.p2", "R3.p1", "R4.p1"],
-            ["R3.p2", "C2.p1", "C3.p2"],
-            ["B1.p2", "C1.p2", "R5.p1"],
-            ["R5.p2", "R4.p2", "C2.p2", "C3.p1"],
-        ],
-    )
-
-
 CASES = [
     case_301_three_stage_rc_ladder,
     case_302_rectangular_bridge_network,
     case_303_mixed_parallel_filter_bank,
-    case_304_dual_loop_multi_shunt,
-    case_305_dense_supported_grid,
 ]
 
 
@@ -294,9 +201,9 @@ def generate(output_dir: Path, seed: int, count: int | None = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_cases = CASES if count is None else CASES[: max(0, min(count, len(CASES)))]
     manifest = {
-        "schema_version": "handdrawn-advanced-showcase-v1",
+        "schema_version": "handdrawn-advanced-showcase-selected-v1",
         "seed": seed,
-        "generator": "tools/generate_advanced_showcase_circuits.py",
+        "generator": "tools/generators/generate_advanced_showcase_circuits.py",
         "canvas_size": [CANVAS_W, CANVAS_H],
         "case_count": len(selected_cases),
         "supported_classes": ["voltage_source", "resistor", "capacitor"],
@@ -321,7 +228,7 @@ def generate(output_dir: Path, seed: int, count: int | None = None) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate advanced hand-drawn showcase circuits.")
+    parser = argparse.ArgumentParser(description="Generate selected advanced hand-drawn showcase circuits (301-303).")
     parser.add_argument(
         "--output-dir",
         default="data/generated/handdrawn_advanced_showcase",
@@ -332,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--count",
         type=int,
         default=None,
-        help="Generate the first N advanced cases. Defaults to all 5.",
+        help="Generate the first N selected advanced cases. Defaults to 301-303.",
     )
     return parser
 

@@ -18,7 +18,6 @@ import numpy as np
 from generate_handdrawn_tests import (
     connect_path,
     draw_capacitor,
-    draw_hand_line,
     draw_label,
     draw_resistor,
     draw_source,
@@ -44,46 +43,6 @@ def add_case_notes(
         or ["voltage_source", "resistor", "capacitor"],
         "intended_use": "showcase",
     }
-
-
-def case_201_rc_ladder_two_shunts(rng: random.Random) -> tuple[np.ndarray, dict]:
-    image = paper_background(rng)
-    comps = [
-        draw_source(image, (140, 330), rng, "B1", "v"),
-        draw_resistor(image, (335, 165), rng, "R1", "h", "zigzag"),
-        draw_resistor(image, (585, 165), rng, "R2", "h", "box"),
-        draw_capacitor(image, (460, 360), rng, "C1", "v"),
-        draw_capacitor(image, (780, 360), rng, "C2", "v"),
-    ]
-
-    connect_path(image, [(140, 246), (140, 165), (261, 165)], rng)
-    connect_path(image, [(409, 165), (511, 165)], rng)
-    connect_path(image, [(659, 165), (780, 165), (780, 286)], rng)
-    connect_path(image, [(460, 165), (460, 286)], rng)
-    connect_path(image, [(460, 434), (460, 520), (140, 520), (140, 414)], rng)
-    connect_path(image, [(780, 434), (780, 520)], rng)
-
-    for point in [(460, 165), (460, 520), (780, 520)]:
-        draw_node_dot(image, point)
-    draw_label(image, "R1", (315, 120), rng, 0.85)
-    draw_label(image, "R2", (565, 120), rng, 0.85)
-    draw_label(image, "C1", (485, 355), rng, 0.8)
-    draw_label(image, "C2", (805, 355), rng, 0.8)
-
-    return finish_image(image, rng), add_case_notes(
-        {
-            "case_id": "201_rc_ladder_two_shunts",
-            "stressors": ["rc_ladder", "two_t_junctions", "multi_pin_return_bus"],
-            "expected_components": comps,
-            "expected_nets": [
-                ["B1.p1", "R1.p1"],
-                ["R1.p2", "R2.p1", "C1.p1"],
-                ["R2.p2", "C2.p1"],
-                ["B1.p2", "C1.p2", "C2.p2"],
-            ],
-        },
-        difficulty="medium_showcase",
-    )
 
 
 def case_202_bridge_network(rng: random.Random) -> tuple[np.ndarray, dict]:
@@ -202,57 +161,10 @@ def case_204_dual_loop_shared_branch(rng: random.Random) -> tuple[np.ndarray, di
     )
 
 
-def case_205_rc_feedback_like_grid(rng: random.Random) -> tuple[np.ndarray, dict]:
-    image = paper_background(rng)
-    comps = [
-        draw_source(image, (130, 330), rng, "B1", "v"),
-        draw_resistor(image, (330, 170), rng, "R1", "h", "box"),
-        draw_resistor(image, (620, 170), rng, "R2", "h", "zigzag"),
-        draw_capacitor(image, (475, 350), rng, "C1", "v"),
-        draw_resistor(image, (760, 350), rng, "R3", "v", "box"),
-        draw_capacitor(image, (620, 520), rng, "C2", "h"),
-    ]
-
-    connect_path(image, [(130, 246), (130, 170), (256, 170)], rng)
-    connect_path(image, [(404, 170), (546, 170)], rng)
-    connect_path(image, [(694, 170), (760, 170), (760, 276)], rng)
-    connect_path(image, [(475, 170), (475, 276)], rng)
-    connect_path(image, [(475, 424), (475, 520), (546, 520)], rng)
-    connect_path(image, [(760, 424), (760, 520), (694, 520)], rng)
-    connect_path(image, [(546, 520), (130, 520), (130, 414)], rng)
-
-    # A short feedback-looking but valid connected bus segment between middle nodes.
-    draw_hand_line(image, (475, 170), (475, 210), rng)
-    draw_hand_line(image, (475, 210), (620, 210), rng)
-    draw_hand_line(image, (620, 210), (620, 170), rng)
-
-    for point in [(475, 170), (620, 170), (475, 520), (760, 520)]:
-        draw_node_dot(image, point)
-    draw_label(image, "RC grid", (530, 115), rng, 0.75)
-
-    return finish_image(image, rng), add_case_notes(
-        {
-            "case_id": "205_rc_feedback_like_grid",
-            "stressors": ["six_components", "short_bus_loop", "dense_but_supported"],
-            "expected_components": comps,
-            "expected_nets": [
-                ["B1.p1", "R1.p1"],
-                ["R1.p2", "R2.p1", "C1.p1"],
-                ["R2.p2", "R3.p1"],
-                ["B1.p2", "C1.p2", "C2.p1"],
-                ["R3.p2", "C2.p2"],
-            ],
-        },
-        difficulty="hard_showcase",
-    )
-
-
 CASES = [
-    case_201_rc_ladder_two_shunts,
     case_202_bridge_network,
     case_203_parallel_load_bank,
     case_204_dual_loop_shared_branch,
-    case_205_rc_feedback_like_grid,
 ]
 
 
@@ -260,9 +172,9 @@ def generate(output_dir: Path, seed: int, count: int | None = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_cases = CASES if count is None else CASES[: max(0, min(count, len(CASES)))]
     manifest = {
-        "schema_version": "handdrawn-showcase-v1",
+        "schema_version": "handdrawn-showcase-selected-v1",
         "seed": seed,
-        "generator": "tools/generate_showcase_circuits.py",
+        "generator": "tools/generators/generate_showcase_circuits.py",
         "case_count": len(selected_cases),
         "supported_classes": ["voltage_source", "resistor", "capacitor"],
         "cases": [],
@@ -286,7 +198,7 @@ def generate(output_dir: Path, seed: int, count: int | None = None) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate richer showcase circuit images.")
+    parser = argparse.ArgumentParser(description="Generate selected showcase circuit images (202-204).")
     parser.add_argument(
         "--output-dir",
         default="data/generated/handdrawn_showcase",
@@ -297,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--count",
         type=int,
         default=None,
-        help="Generate the first N showcase cases. Defaults to all 5.",
+        help="Generate the first N selected showcase cases. Defaults to 202-204.",
     )
     return parser
 

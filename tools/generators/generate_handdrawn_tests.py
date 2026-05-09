@@ -418,7 +418,7 @@ def generate(output_dir: Path, seed: int) -> dict:
     manifest = {
         "schema_version": "handdrawn-stress-v1",
         "seed": seed,
-        "generator": "tools/generate_handdrawn_tests.py",
+        "generator": "tools/generators/generate_handdrawn_tests.py",
         "cases": [],
     }
     for index, case_fn in enumerate(CASES, start=1):

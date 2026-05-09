@@ -1,6 +1,6 @@
 """Production end-to-end pipeline entry point.
 
-``run_pipeline`` executes the current 2.2 topology-recovery chain: image
+``run_pipeline`` executes the current deterministic topology-recovery chain: image
 preprocess, component proposals, wire evidence, evidence graph, terminal
 attachments, supported graph, graph-derived nodes, topology/netlist, DXF, and
 compact audit artifacts. Step-by-step visualization belongs in ``debug_run.py``.

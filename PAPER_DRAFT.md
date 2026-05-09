@@ -185,4 +185,4 @@ flowchart TD
 
 本项目当前主链路已经完成从图像输入到拓扑、网络表、DXF 和审计结果输出。工程实现中保留了调试输出、传统节点生成结果和回退机制，以便在不同样例上进行可解释验证。
 
-需要说明的是，当前工程中仍保留少量轻量演示和评测接口，正式评估入口以 `tools/run_agent_eval_harness.py` 为准，正式智能体入口以 `tools/run_agent_repair_advisor.py`、`tools/run_agent_repair_apply.py` 和 `tools/run_agent_failure_memory.py` 为准。
+需要说明的是，当前工程将单图演示入口收口到 `main_run.py`，批量实验入口收口到 `tools/experiment_a/run_experiment_a.py` 与 `tools/experiment_b/run_experiment_b.py`；底层 Agent advisor、apply、eval 逻辑由 `src/agent_workflow/` 中的函数承载。
